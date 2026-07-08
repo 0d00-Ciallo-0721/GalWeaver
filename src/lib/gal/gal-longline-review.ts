@@ -124,6 +124,8 @@ function buildLonglineReviewPrompt(
     "- rewriteTargets 只能包含目标长线节点，不能包含边界节点。",
     "- missingScripts 只列出目标长线节点正文缺失。",
     "- 如果建议新增过渡节点，只能放在 suggestedInsertions，不要直接生成节点数据。",
+    "- 长线剧情目标节点允许只有一个自然推进选项；不要把“选项数量不足”“只有一个选项”“不利于分支”当成问题。",
+    "- 本检查只判断正文连续性，不检查选项数量、分支丰富度或玩家选择数量。",
     "- 如果没有问题，对应数组输出空数组。",
     "",
     "## 检查重点",
@@ -240,7 +242,7 @@ function normalizeIssues(value: unknown, targetIds: Set<string>): GalLonglineIss
     severity: normalizeSeverity(item?.severity),
     category: String(item?.category ?? "").trim(),
     detail: String(item?.detail ?? "").trim(),
-  })).filter((item) => targetIds.has(item.nodeId) && item.detail)
+  })).filter((item) => targetIds.has(item.nodeId) && item.detail && !isChoiceCountIssue(item))
 }
 
 function normalizeBreaks(value: unknown, targetIds: Set<string>): GalLonglineContinuityBreak[] {
@@ -275,6 +277,27 @@ function normalizeRewriteTargets(value: unknown, targetIds: Set<string>): GalLon
 
 function normalizeSeverity(value: unknown): GalLonglineIssue["severity"] {
   return value === "info" || value === "warning" || value === "error" ? value : "warning"
+}
+
+function isChoiceCountIssue(item: GalLonglineIssue): boolean {
+  const text = `${item.category}\n${item.detail}`.toLowerCase()
+  return [
+    "选项数量",
+    "選項數量",
+    "选项不足",
+    "選項不足",
+    "只有一个选项",
+    "只有一個選項",
+    "只提供了一个选项",
+    "只提供了一個選項",
+    "未提供任何选项",
+    "未提供任何選項",
+    "不利于线路分支",
+    "不利於線路分支",
+    "player choice",
+    "choice count",
+    "only one option",
+  ].some((keyword) => text.includes(keyword))
 }
 
 function normalizeBreakType(value: unknown): GalLonglineContinuityBreak["type"] {
