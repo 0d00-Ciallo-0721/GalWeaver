@@ -3,7 +3,7 @@ import { useWikiStore, type LlmConfig } from "@/stores/wiki-store"
 import type { GalLonglineReviewNodeInput, GalLonglineReviewReport } from "./gal-longline-review"
 import type { GalProject, GalRoute } from "./gal-types"
 
-export type GalLonglineOptimizeMode = "missing_only" | "problem_nodes" | "whole_range"
+export type GalLonglineOptimizeMode = "missing_only" | "problem_nodes" | "whole_range" | "story_enhance"
 
 export type GalLonglineOptimizeSuggestion = "keep" | "rewrite" | "patch"
 
@@ -64,7 +64,9 @@ export async function generateGalLonglineOptimizationPlan(
     {
       role: "system",
       content: [
-        "你是 Galgame 长线剧情正文优化编辑。",
+        params.mode === "story_enhance"
+          ? "你是 Galgame 剧情导演和小说编辑，擅长增强长线剧情的连贯性、沉浸感和情绪推进。"
+          : "你是 Galgame 长线剧情正文优化编辑。",
         "你只生成优化预览方案，不保存、不新增节点、不输出 Markdown。",
         "必须严格输出 JSON，不能输出解释文字。",
         "上游边界和下游边界只读，禁止改写边界节点，禁止把边界节点放入 nodeOptimizations。",
@@ -131,7 +133,8 @@ function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string 
     "- 不允许输出上游边界节点或下游边界节点的优化方案。",
     "- suggestedInsertions 只允许建议插入在两个相邻目标长线节点之间。",
     "- 不允许插入到上游边界之前，也不允许插入到下游边界之后。",
-    "- suggestedInsertions 必须包含完整 script；没有正文就不要输出该建议。",
+    "- suggestedInsertions 必须包含完整 title、goal、summary、script、reason；没有完整正文就不要输出该建议。",
+    "- 如果需要中继节点，必须基于前后相邻目标节点生成基础信息，并确保剧情入口承接 afterNodeId、剧情出口导向 beforeNodeId。",
     "- suggestedInsertions 只是预览建议，不会自动写入 project。",
     "- optimizedScript 必须是该目标节点的完整正文，不要只给片段。",
     "- suggestion 只能是 keep、rewrite、patch。",
@@ -140,6 +143,7 @@ function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string 
     "",
     "## 模式约束",
     modeDirective(params.mode),
+    params.mode === "story_enhance" ? storyEnhancementDirective() : "",
     "",
     "## 上下文注入策略（必须遵守）",
     "1. 整体方案层面允许参考上下游边界，判断整段方向。",
@@ -167,6 +171,9 @@ function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string 
     "",
     "## 逐节点优化上下文",
     params.targetNodes.map((item, index) => formatNodeOptimizationContext(params, item, index)).join("\n\n"),
+    "",
+    "## 可插入中继节点的位置",
+    formatInsertionContexts(params),
   ].join("\n")
 }
 
@@ -177,13 +184,31 @@ function modeDirective(mode: GalLonglineOptimizeMode): string {
   if (mode === "problem_nodes") {
     return "- 只优化检查报告中 issues、continuityBreaks、rewriteTargets 涉及的目标节点；没有问题的节点不需要输出。"
   }
+  if (mode === "story_enhance") {
+    return "- 作为剧情导演增强整段目标长线：允许扩写目标节点正文，允许在相邻目标节点之间建议中继节点，但必须保持单线结构和原剧情方向。"
+  }
   return "- 可以优化整段目标长线，并可在确有必要时建议新增过渡节点；新增节点只能放在 suggestedInsertions。"
 }
 
 function modeText(mode: GalLonglineOptimizeMode): string {
   if (mode === "missing_only") return "只补缺失正文"
   if (mode === "problem_nodes") return "优化有问题节点"
+  if (mode === "story_enhance") return "剧情增强/扩写长线"
   return "优化整段长线"
+}
+
+function storyEnhancementDirective(): string {
+  return [
+    "## 剧情增强/扩写要求",
+    "- 目标不是只纠错，而是让这段长线更好看、更顺、更有情绪价值。",
+    "- 可以扩写目标节点正文，补充动作、对话、心理反应、场景细节和结尾钩子。",
+    "- 每个被改写的目标节点必须仍然服务原 node.goal，不得改变玩家选择导致的核心剧情结果。",
+    "- 第一目标节点必须自然承接上游边界；最后目标节点必须自然导向下游边界。",
+    "- 中间目标节点要持续推进事件，避免原地重复。",
+    "- 如果两个相邻目标节点之间缺少情绪、时间、地点或行动过渡，可以建议新增一个中继节点。",
+    "- 中继节点不能新增分叉、不能新增变量、不能改变前后节点结论；它只负责让 A -> B 更自然。",
+    "- 中继节点 script 必须是完整正文，且正文开头承接 afterNodeId，正文结尾导向 beforeNodeId。",
+  ].join("\n")
 }
 
 function formatReviewReport(report: GalLonglineReviewReport | null): string {
@@ -253,6 +278,27 @@ function formatNodeOptimizationContext(
   ].filter(Boolean).join("\n")
 }
 
+function formatInsertionContexts(params: GalLonglineOptimizationParams): string {
+  if (params.targetNodes.length < 2) return "目标长线节点不足 2 个，不能插入中继节点。"
+  return params.targetNodes.slice(0, -1).map((item, index) => {
+    const next = params.targetNodes[index + 1]
+    return [
+      `### 插入位置 ${index + 1}`,
+      `afterNodeId：${item.node.id}`,
+      `afterTitle：${item.node.title}`,
+      `afterGoal：${item.node.goal || "未填写"}`,
+      `afterSummary：${item.node.summary || "未填写"}`,
+      `afterScriptEnding：${item.script.trim().slice(-600) || "正文缺失"}`,
+      `beforeNodeId：${next.node.id}`,
+      `beforeTitle：${next.node.title}`,
+      `beforeGoal：${next.node.goal || "未填写"}`,
+      `beforeSummary：${next.node.summary || "未填写"}`,
+      `beforeScriptBeginning：${next.script.trim().slice(0, 600) || "正文缺失"}`,
+      "如果在此处建议中继节点，script 必须从 afterScriptEnding 的情绪/动作自然接起，并在结尾把人物状态、场景或行动推进到 beforeScriptBeginning。",
+    ].join("\n")
+  }).join("\n\n")
+}
+
 function parseOptimizationResponse(raw: string): Partial<GalLonglineOptimizationPlan> {
   const jsonText =
     raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.match(/\{[\s\S]*\}/)?.[0]
@@ -308,7 +354,7 @@ function normalizeSuggestedInsertions(
   for (let index = 0; index < params.targetNodes.length - 1; index += 1) {
     adjacentPairs.add(`${params.targetNodes[index].node.id}->${params.targetNodes[index + 1].node.id}`)
   }
-  return value.map((item, index) => {
+  const normalized = value.map((item, index) => {
     const afterNodeId = String(item?.afterNodeId ?? "").trim()
     const beforeNodeId = String(item?.beforeNodeId ?? "").trim()
     return {
@@ -321,7 +367,15 @@ function normalizeSuggestedInsertions(
       script: String(item?.script ?? "").trim(),
       reason: String(item?.reason ?? "").trim(),
     }
-  }).filter((item) =>
+  })
+  const incompleteAdjacent = normalized.filter((item) =>
+    adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`)
+    && (!item.title || !item.goal || !item.summary || !item.script || !item.reason)
+  )
+  if (params.mode === "story_enhance" && incompleteAdjacent.length > 0) {
+    throw new Error("剧情增强生成了不完整的中继节点建议，已触发自动重试。中继节点必须包含标题、目标、摘要、完整正文和原因。")
+  }
+  return normalized.filter((item) =>
     adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`)
     && item.title
     && item.goal

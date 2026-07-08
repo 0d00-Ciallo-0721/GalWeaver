@@ -178,11 +178,13 @@ export function GalLonglineWorkspace({
     try {
       const plan = await galStore.runAiTask(
         {
-          title: "生成长线优化方案",
-          detail: "正在生成正文优化预览，不会保存项目...",
+          title: optimizeMode === "story_enhance" ? "生成剧情增强方案" : "生成长线优化方案",
+          detail: optimizeMode === "story_enhance"
+            ? "正在增强长线剧情连贯性与体验感，不会保存项目..."
+            : "正在生成正文优化预览，不会保存项目...",
         },
         async (task) => {
-          task.update("正在组织长线优化上下文...")
+          task.update(optimizeMode === "story_enhance" ? "正在组织剧情增强上下文..." : "正在组织长线优化上下文...")
           const result = await generateGalLonglineOptimizationPlan({
             project: galStore.project!,
             route,
@@ -196,7 +198,7 @@ export function GalLonglineWorkspace({
               ? { node: range.downstreamBoundary, script: scripts[range.downstreamBoundary.id] ?? "" }
               : null,
           })
-          task.update("优化方案已生成。")
+          task.update(optimizeMode === "story_enhance" ? "剧情增强方案已生成。" : "优化方案已生成。")
           return result
         },
       )
@@ -736,6 +738,7 @@ function LonglineHeader({
             <option value="missing_only">只补缺失正文</option>
             <option value="problem_nodes">优化有问题节点</option>
             <option value="whole_range">优化整段长线</option>
+            <option value="story_enhance">剧情增强/扩写长线</option>
           </select>
           <button type="button" disabled={optimizing} onClick={onGenerateOptimization} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50">
             {optimizing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
