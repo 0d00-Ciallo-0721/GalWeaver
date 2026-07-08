@@ -1,0 +1,6 @@
+# Cargo 配置 — 减小开发构建体积
+# 去掉调试符号，target/ 从 ~40GB 降到 ~5GB
+
+[profile.dev]
+debug = 0
+opt-level = 1

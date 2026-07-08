@@ -7,7 +7,7 @@
  *
  * 上下文组装顺序：
  *   项目灵魂 → 项目大纲 → 角色档案 → Gal 全局设定
- *   → 线路主题 → 当前节点卡片 → 父节点结尾
+ *   → 线路主题 → 当前节点卡片 → 父节点结尾 → 子节点前文
  *   → 路径摘要 → 变量状态 → 角色情绪 → 线索 → 角色认知
  */
 
@@ -53,6 +53,8 @@ export interface GalContextPack {
   nodeCard: string
   /** 父节点结尾 */
   parentEndings: string
+  /** 子节点前文 */
+  childBeginnings: string
   /** 路径摘要（从入口到父节点的各节点摘要链） */
   pathSummary: string
   /** 当前变量状态 */
@@ -104,6 +106,7 @@ export async function buildGalContextPack(
     novelCharStates,
     projectDocs,
     parentEndings,
+    childBeginnings,
     pathSummary,
     variableStateText,
     characterMoodsText,
@@ -114,7 +117,8 @@ export async function buildGalContextPack(
     loadOutlineSafe(pp),
     loadCharacterStatesSafe(pp),
     loadProjectDocs(pp),
-    buildParentEndings(pp, routeId, node),
+    buildParentEndings(pp, route, node),
+    buildChildBeginnings(pp, route, node),
     buildPathSummary(pp, route, node),
     buildVariableState(node),
     buildCharacterMoods(node),
@@ -134,6 +138,7 @@ export async function buildGalContextPack(
     characterProfiles: buildCharacterProfiles(globalMemory, novelCharStates),
     nodeCard: buildNodeCard(node),
     parentEndings,
+    childBeginnings,
     pathSummary,
     variableState: variableStateText,
     characterMoods: characterMoodsText,
@@ -167,8 +172,9 @@ export function galContextPackToPrompt(pack: GalContextPack): string {
   add("不可违背的规则", pack.globalRules)
   add("当前线路主题", pack.routeTheme)
   add("角色档案", pack.characterProfiles)
-  add("当前节点信息", pack.nodeCard)
+  add("当前节点卡片（重要提示词部分）", pack.nodeCard)
   add("父节点结尾", pack.parentEndings)
+  add("子节点前文", pack.childBeginnings)
   add("路径摘要（从入口到当前）", pack.pathSummary)
   add("当前变量状态", pack.variableState)
   add("角色情绪", pack.characterMoods)
@@ -193,15 +199,12 @@ function buildNodeCard(node: GalNode): string {
   if (node.choices.length > 0) {
     lines.push("- 当前选项：")
     node.choices.forEach((choice, index) => {
-      const effects = choice.effects.length > 0
-        ? choice.effects.map((effect) => `${effect.variable} ${effect.op === "add" ? "+" : "="}${String(effect.value)}`).join("，")
-        : "无"
       lines.push(
-        `  ${index + 1}. [${choice.id}] ${choice.text}；情感意图：${choice.emotionalIntent || "未设置"}；变量影响：${effects}；建议后续：${choice.nextNodeTitle || "未设置"} ${choice.nextNodeGoal || ""}`.trimEnd(),
+        `  ${index + 1}. [${choice.id}] ${choice.text}；情感意图：${choice.emotionalIntent || "未设置"}；建议后续：${choice.nextNodeTitle || "未设置"} ${choice.nextNodeGoal || ""}`.trimEnd(),
       )
     })
   } else {
-    lines.push("- 当前选项：未预设，可由 AI 根据剧情自然生成")
+    lines.push("- 当前选项：未预设，不要生成新选项")
   }
 
   return lines.join("\n")
@@ -244,29 +247,84 @@ function buildCharacterProfiles(
  */
 async function buildParentEndings(
   projectPath: string,
-  routeId: string,
+  route: GalRoute,
   node: GalNode,
 ): Promise<string> {
   if (node.parents.length === 0) return "（入口节点，无父节点）"
 
   const endings: string[] = []
   for (const parentId of node.parents) {
+    const parentNode = route.nodes.find((n) => n.id === parentId)
     // 优先从节点记忆中获取结尾
     const memory = await loadNodeMemory(projectPath, parentId)
-    if (memory?.endingText) {
+    if (memory?.endingText?.trim()) {
       endings.push(`### 父节点 ${parentId}\n${memory.endingText}`)
       continue
     }
 
     // 降级：读取正文取末 500 字
-    const script = await loadNodeScript(projectPath, routeId, parentId)
-    if (script) {
+    const script = await loadNodeScript(projectPath, route.id, parentId)
+    if (script?.trim()) {
       const tail = script.slice(-500).trim()
       endings.push(`### 父节点 ${parentId}\n...${tail}`)
+      continue
     }
+
+    endings.push(`### 父节点 ${parentId}\n${buildNodeFallbackText(parentNode)}`)
   }
 
-  return endings.join("\n\n")
+  const prefix = node.parents.length > 1
+    ? "该节点是收束节点。以下为多个直接父节点的结尾，请生成能兼容所有入口的共同正文，不要只承接其中一条。\n\n"
+    : "该节点是普通剧情节点。以下为唯一直接父节点的结尾，请自然承接。\n\n"
+
+  return `${prefix}${endings.join("\n\n")}`.trim()
+}
+
+async function buildChildBeginnings(
+  projectPath: string,
+  route: GalRoute,
+  node: GalNode,
+): Promise<string> {
+  const childIds = collectDirectChildIds(node)
+  if (childIds.length === 0) return "（无后继节点）"
+
+  const beginnings: string[] = []
+  for (const childId of childIds) {
+    const childNode = route.nodes.find((n) => n.id === childId)
+    const script = await loadNodeScript(projectPath, route.id, childId)
+    if (script?.trim()) {
+      beginnings.push(`### 子节点 ${childId}\n${script.slice(0, 500).trim()}...`)
+      continue
+    }
+
+    beginnings.push(`### 子节点 ${childId}\n${buildNodeFallbackText(childNode)}`)
+  }
+
+  const prefix = childIds.length > 1
+    ? "当前节点有多个直接后继节点。以下为后继节点开头/卡片信息，请让当前正文自然停在能通向这些后继的断点。\n\n"
+    : "当前节点有一个直接后继节点。以下为后继节点开头/卡片信息，请让当前正文自然衔接它。\n\n"
+
+  return `${prefix}${beginnings.join("\n\n")}`.trim()
+}
+
+function collectDirectChildIds(node: GalNode): string[] {
+  return Array.from(new Set([
+    ...(node.children ?? []),
+    ...(node.choices ?? [])
+      .map((choice) => choice.nextNodeId)
+      .filter((id): id is string => Boolean(id)),
+  ]))
+}
+
+function buildNodeFallbackText(node: GalNode | undefined): string {
+  if (!node) return ""
+
+  return [
+    `标题：${node.title || ""}`,
+    `人物：${(node.characters ?? []).join("、")}`,
+    `目标：${node.goal || ""}`,
+    `场景：${node.scene || ""}`,
+  ].filter((line) => line.replace(/^(标题|人物|目标|场景)：/, "").trim()).join("\n")
 }
 
 /**
@@ -489,6 +547,7 @@ function emptyGalContextPack(task: string): GalContextPack {
     characterProfiles: "",
     nodeCard: "",
     parentEndings: "",
+    childBeginnings: "",
     pathSummary: "",
     variableState: "",
     characterMoods: "",

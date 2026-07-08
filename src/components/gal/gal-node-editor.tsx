@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   GitBranchPlus,
   Link2,
+  ListPlus,
   Loader2,
   Map as MapIcon,
   Plus,
@@ -10,11 +11,15 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  Unlink,
 } from "lucide-react"
 import { useGalStore } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
-import { expandChildNodeCard, generateNodeScript } from "@/lib/gal/gal-node-generation"
+import { generateNodeChoices } from "@/lib/gal/gal-choice-generation"
+import { backfillIncomingChoices } from "@/lib/gal/gal-choice-backfill"
+import { expandChildNodeCard, generateChoiceLongLineCards, generateNodeScript, type ChildNodeCardResult } from "@/lib/gal/gal-node-generation"
 import { ingestNode } from "@/lib/gal/gal-node-ingest"
+import { updateNodeSummary } from "@/lib/gal/gal-node-summary"
 import {
   deleteNodeScript,
   loadGalProject,
@@ -22,8 +27,9 @@ import {
   saveGalProject,
   saveNodeScript,
 } from "@/lib/gal/gal-storage"
+import { sanitizeGalChoices } from "@/lib/gal/gal-variable-guard"
 import { getNodeStatusLabel, getNodeTypeColor, getNodeTypeLabel } from "./gal-utils"
-import type { BranchLintResult, GalChoice, GalEffect, GalNode, GalRoute } from "@/lib/gal/gal-types"
+import type { BranchLintResult, GalChoice, GalEffect, GalNode, GalRoute, GalStateSnapshot, GalVariable } from "@/lib/gal/gal-types"
 
 interface GalNodeEditorProps {
   onLintBranch: () => void
@@ -34,6 +40,7 @@ interface GalNodeEditorProps {
   reinitializing?: boolean
   onShowInitContext?: () => void
   loadingInitContext?: boolean
+  onOpenLonglineWorkspace?: (nodeId: string) => void
 }
 
 export function GalNodeEditor({
@@ -45,21 +52,28 @@ export function GalNodeEditor({
   reinitializing = false,
   onShowInitContext,
   loadingInitContext = false,
+  onOpenLonglineWorkspace,
 }: GalNodeEditorProps) {
   const project = useWikiStore((s) => s.project)
   const galStore = useGalStore()
   const node = galStore.selectedNode()
   const route = galStore.currentNodeRoute() ?? galStore.selectedRoute()
   const selectedRouteId = useGalStore((s) => s.selectedRouteId)
+  const currentNodeGenerating = Boolean(node && galStore.generatingNodeIds.includes(node.id))
 
   const [scriptContent, setScriptContent] = useState("")
   const [aiPrompt, setAiPrompt] = useState("")
+  const [choicePrompt, setChoicePrompt] = useState("")
   const [draftTitle, setDraftTitle] = useState("")
   const [draftGoal, setDraftGoal] = useState("")
   const [draftScene, setDraftScene] = useState("")
   const [draftCharacters, setDraftCharacters] = useState("")
   const [draftChoices, setDraftChoices] = useState<GalChoice[]>([])
   const [saving, setSaving] = useState(false)
+  const [summarizing, setSummarizing] = useState(false)
+  const [_backfilling, setBackfilling] = useState(false)
+  const [generatingChoices, setGeneratingChoices] = useState(false)
+  const [showChoiceCountPicker, setShowChoiceCountPicker] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [expanding, setExpanding] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
@@ -85,6 +99,7 @@ export function GalNodeEditor({
     if (!project || !route || !node) {
       setScriptContent("")
       setAiPrompt("")
+      setChoicePrompt("")
       setDraftTitle("")
       setDraftGoal("")
       setDraftScene("")
@@ -99,6 +114,7 @@ export function GalNodeEditor({
     setDraftCharacters((node.characters ?? []).join("、"))
     setDraftChoices(cloneChoices(node.choices ?? []))
     setAiPrompt(node.aiPrompt ?? "")
+    setChoicePrompt(node.choicePrompt ?? "")
 
     const load = async () => {
       try {
@@ -110,7 +126,7 @@ export function GalNodeEditor({
     void load()
   }, [project, route?.id, node?.id])
 
-  const saveDraft = useCallback(async (status?: GalNode["status"]) => {
+  const saveDraft = useCallback(async (status?: GalNode["status"], choicesOverride?: GalChoice[]) => {
     if (!project || !route || !node) return null
     await saveNodeScript(project.path, route.id, node.id, scriptContent)
     const galProject = await loadGalProject(project.path)
@@ -128,8 +144,10 @@ export function GalNodeEditor({
     )
     const directChildren = (nodeToSave.children ?? [])
       .filter((childId) => !previousChoiceChildren.has(childId))
+    const choicesToSave = choicesOverride ?? draftChoices
+    const safeChoices = sanitizeGalChoices(choicesToSave, galProject.variables ?? [])
     const nextChoiceChildren = new Set(
-      draftChoices
+      safeChoices
         .map((choice) => choice.nextNodeId)
         .filter((childId): childId is string => Boolean(childId)),
     )
@@ -140,7 +158,8 @@ export function GalNodeEditor({
     nodeToSave.scene = draftScene
     nodeToSave.characters = splitCharacters(draftCharacters)
     nodeToSave.aiPrompt = aiPrompt
-    nodeToSave.choices = cloneChoices(draftChoices)
+    nodeToSave.choicePrompt = choicePrompt
+    nodeToSave.choices = cloneChoices(safeChoices)
     nodeToSave.children = Array.from(nextChildren)
     nodeToSave.updatedAt = new Date().toISOString()
     if (status) nodeToSave.status = status
@@ -158,7 +177,32 @@ export function GalNodeEditor({
     const refreshed = await loadGalProject(project.path)
     galStore.setProject(refreshed)
     return refreshed
-  }, [project, route, node, scriptContent, aiPrompt, draftTitle, draftGoal, draftScene, draftCharacters, draftChoices, galStore])
+  }, [project, route, node, scriptContent, aiPrompt, choicePrompt, draftTitle, draftGoal, draftScene, draftCharacters, draftChoices, galStore])
+
+  const performIncomingChoiceBackfill = useCallback(async (content: string) => {
+    if (!project || !route || !node || !content.trim()) return 0
+    setBackfilling(true)
+    try {
+      const count = await galStore.runAiTask(
+        {
+          title: `回写前置选项：${node.title}`,
+          detail: "调用 AI 根据正文优化前置选项...",
+        },
+        () => backfillIncomingChoices({
+          projectPath: project.path,
+          routeId: route.id,
+          nodeId: node.id,
+          scriptContent: content,
+        }),
+      )
+      if (count > 0) {
+        galStore.setProject(await loadGalProject(project.path))
+      }
+      return count
+    } finally {
+      setBackfilling(false)
+    }
+  }, [project, route, node, galStore])
 
   const handleSaveDraft = useCallback(async () => {
     setSaving(true)
@@ -166,47 +210,66 @@ export function GalNodeEditor({
     try {
       await saveDraft()
       setMessage("保存完成")
+      const backfilledCount = await performIncomingChoiceBackfill(scriptContent)
+      if (backfilledCount > 0) {
+        setMessage(`保存完成，已按当前正文回写 ${backfilledCount} 个前置选项。`)
+      }
     } catch (err) {
       setMessage(`保存失败: ${err instanceof Error ? err.message : "未知错误"}`)
     } finally {
       setSaving(false)
     }
-  }, [saveDraft])
+  }, [saveDraft, performIncomingChoiceBackfill, scriptContent])
 
   const runGeneration = useCallback(async (replaceExisting: boolean) => {
     if (!project || !route || !node) return
+    if (useGalStore.getState().generatingNodeIds.includes(node.id)) return
+    const isCurrentNode = () => useGalStore.getState().selectedNodeId === node.id
     galStore.setGenerating(true, node.id)
     setMessage(null)
     try {
       setMessage("正在保存当前节点...")
       await saveDraft()
       if (replaceExisting) {
-        setMessage("正在删除原正文...")
+        if (isCurrentNode()) setMessage("正在删除原正文...")
         await saveNodeScript(project.path, route.id, node.id, "")
-        setScriptContent("")
+        if (isCurrentNode()) setScriptContent("")
       }
-      setMessage("正在调用 AI 生成正文...")
-      const { script, choices } = await generateNodeScript({
-        projectPath: project.path,
-        routeId: route.id,
-        nodeId: node.id,
-        userPrompt: aiPrompt,
-        onToken: () => {},
-      })
-      setScriptContent(script)
+      if (isCurrentNode()) setMessage("正在调用 AI 生成正文...")
+      const { script, choices } = await galStore.runAiTask(
+        {
+          title: `${replaceExisting ? "重新生成正文" : "生成正文"}：${node.title}`,
+          detail: "调用 AI 生成节点正文...",
+        },
+        () => generateNodeScript({
+          projectPath: project.path,
+          routeId: route.id,
+          nodeId: node.id,
+          userPrompt: aiPrompt,
+          onToken: () => {},
+        }),
+      )
+      if (isCurrentNode()) setScriptContent(script)
+      const backfilledCount = await performIncomingChoiceBackfill(script)
       const refreshed = await loadGalProject(project.path)
       galStore.setProject(refreshed)
       const refreshedNode = refreshed?.routes
         .find((r) => r.id === route.id)
         ?.nodes.find((n) => n.id === node.id)
-      if (refreshedNode) setDraftChoices(cloneChoices(refreshedNode.choices ?? []))
-      setMessage(choices.length > 0 ? "生成完成，选项已写入节点。" : "生成完成")
+      if (isCurrentNode()) {
+        if (refreshedNode) setDraftChoices(cloneChoices(refreshedNode.choices ?? []))
+        setMessage(backfilledCount > 0
+          ? `生成完成，已按正文回写 ${backfilledCount} 个前置选项。`
+          : choices.length > 0 ? "生成完成，选项已写入节点。" : "生成完成")
+      }
     } catch (err) {
-      setMessage(`生成失败: ${err instanceof Error ? err.message : "未知错误"}`)
+      if (isCurrentNode()) {
+        setMessage(`生成失败: ${err instanceof Error ? err.message : "未知错误"}`)
+      }
     } finally {
-      galStore.setGenerating(false)
+      galStore.setGenerating(false, node.id)
     }
-  }, [project, route, node, aiPrompt, saveDraft, galStore])
+  }, [project, route, node, aiPrompt, saveDraft, performIncomingChoiceBackfill, galStore])
 
   const handleFirstGenerate = useCallback(async () => {
     if (scriptContent.trim()) return
@@ -227,19 +290,77 @@ export function GalNodeEditor({
       setMessage("正在保存当前节点...")
       await saveDraft("final")
       setMessage("正在摄取节点记忆...")
-      await ingestNode({
-        projectPath: project.path,
-        routeId: route.id,
-        nodeId: node.id,
-      })
+      await galStore.runAiTask(
+        {
+          title: `摄取记忆：${node.title}`,
+          detail: "调用 AI 提取节点记忆...",
+        },
+        () => ingestNode({
+          projectPath: project.path,
+          routeId: route.id,
+          nodeId: node.id,
+        }),
+      )
+      const backfilledCount = await performIncomingChoiceBackfill(scriptContent)
       galStore.setProject(await loadGalProject(project.path))
-      setMessage("保存并摄取完成。")
+      setMessage(backfilledCount > 0
+        ? `保存并摄取完成，已按正文回写 ${backfilledCount} 个前置选项。`
+        : "保存并摄取完成。")
     } catch (err) {
       setMessage(`保存失败: ${err instanceof Error ? err.message : "未知错误"}`)
     } finally {
       setSaving(false)
     }
-  }, [project, route, node, saveDraft, galStore])
+  }, [project, route, node, scriptContent, saveDraft, performIncomingChoiceBackfill, galStore])
+
+  const handleUpdateSummary = useCallback(async () => {
+    if (!project || !route || !node) return
+    setSummarizing(true)
+    setMessage(null)
+    try {
+      setMessage("正在保存当前节点...")
+      await saveDraft()
+      setMessage("正在生成节点摘要...")
+      const summary = await galStore.runAiTask(
+        {
+          title: `生成摘要：${node.title}`,
+          detail: "调用 AI 更新节点摘要...",
+        },
+        () => updateNodeSummary({
+          projectPath: project.path,
+          routeId: route.id,
+          nodeId: node.id,
+          scriptContent,
+        }),
+      )
+      const backfilledCount = await performIncomingChoiceBackfill(scriptContent)
+      galStore.setProject(await loadGalProject(project.path))
+      setMessage(backfilledCount > 0
+        ? `摘要已更新，并已回写 ${backfilledCount} 个前置选项：${summary}`
+        : `摘要已更新：${summary}`)
+    } catch (err) {
+      setMessage(`摘要更新失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    } finally {
+      setSummarizing(false)
+    }
+  }, [project, route, node, scriptContent, saveDraft, performIncomingChoiceBackfill, galStore])
+
+  const handleBackfillIncomingChoices = useCallback(async () => {
+    if (!scriptContent.trim()) {
+      setMessage("当前节点正文为空，不会覆盖前置选项。")
+      return
+    }
+    setMessage("正在根据当前节点正文回写前置选项...")
+    try {
+      await saveDraft()
+      const count = await performIncomingChoiceBackfill(scriptContent)
+      setMessage(count > 0
+        ? `已按当前节点正文回写 ${count} 个前置选项。`
+        : "当前节点没有已连接的前置选项，无需回写。")
+    } catch (err) {
+      setMessage(`前置选项回写失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    }
+  }, [scriptContent, saveDraft, performIncomingChoiceBackfill])
 
   const attachChildNode = useCallback(async (choiceId: string, childNode: GalNode) => {
     if (!project || !route || !node) return
@@ -251,7 +372,15 @@ export function GalNodeEditor({
       throw new Error("创建后续节点失败：当前节点或选项不存在")
     }
 
+    if (routeToSave.nodes.some((item) => item.id === childNode.id)) {
+      throw new Error(`创建后续节点失败：节点 ID ${childNode.id} 已存在`)
+    }
+
     choiceToSave.nextNodeId = childNode.id
+    childNode.incomingState = applyChoiceEffectsToState(
+      parentToSave.outgoingState ?? parentToSave.incomingState ?? createEmptyState(),
+      choiceToSave.effects,
+    )
     parentToSave.children = Array.from(new Set([...(parentToSave.children ?? []), childNode.id]))
     parentToSave.updatedAt = new Date().toISOString()
     routeToSave.nodes.push(childNode)
@@ -266,6 +395,85 @@ export function GalNodeEditor({
     galStore.selectNode(childNode.id)
   }, [project, route, node, selectedRouteId, galStore])
 
+  const attachChoiceLongLine = useCallback(async (choiceId: string, cards: ChildNodeCardResult[]) => {
+    if (!project || !route || !node || cards.length === 0) return []
+    const galProject = await loadGalProject(project.path)
+    const routeToSave = galProject?.routes.find((r) => r.id === route.id)
+    const parentToSave = routeToSave?.nodes.find((n) => n.id === node.id)
+    const choiceToSave = parentToSave?.choices.find((choice) => choice.id === choiceId)
+    if (!galProject || !routeToSave || !parentToSave || !choiceToSave) {
+      throw new Error("创建长线剧情失败：当前节点或选项不存在")
+    }
+    if (choiceToSave.nextNodeId) {
+      throw new Error("创建长线剧情失败：该选项已经连接了后续节点")
+    }
+
+    const now = new Date().toISOString()
+    const nodeIds = cards.map(() => createUniqueNodeId(routeToSave))
+    let incomingState = applyChoiceEffectsToState(
+      parentToSave.outgoingState ?? parentToSave.incomingState ?? createEmptyState(),
+      choiceToSave.effects,
+    )
+    for (let index = 0; index < cards.length; index += 1) {
+      const card = cards[index]
+      const childId = nodeIds[index]
+      const nextId = nodeIds[index + 1]
+      const nextCard = cards[index + 1]
+      const continuationChoice = nextId
+        ? {
+            id: `choice_${Date.now().toString(36)}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+            text: card.choices[0]?.text?.trim() || "继续",
+            emotionalIntent: card.choices[0]?.emotionalIntent || "推进连续剧情",
+            effects: card.choices[0]?.effects ?? [],
+            nextNodeId: nextId,
+            nextNodeTitle: nextCard?.title ?? "",
+            nextNodeGoal: nextCard?.goal ?? "",
+          } satisfies GalChoice
+        : undefined
+      const childNode: GalNode = {
+        id: childId,
+        routeId: route.id,
+        title: card.title,
+        type: card.type,
+        status: "card",
+        parents: [index === 0 ? node.id : nodeIds[index - 1]],
+        children: nextId ? [nextId] : [],
+        goal: card.goal,
+        summary: card.summary,
+        scriptPath: `nodes/${route.id}/${childId}.md`,
+        incomingState,
+        choices: continuationChoice ? [continuationChoice] : [],
+        memoryScope: "node",
+        characters: card.characters,
+        scene: card.scene,
+        clueIds: [],
+        sequence: getNextSequence(routeToSave) + index,
+        createdAt: now,
+        updatedAt: now,
+      }
+      routeToSave.nodes.push(childNode)
+      if (continuationChoice) {
+        incomingState = applyChoiceEffectsToState(incomingState, continuationChoice.effects)
+      }
+    }
+
+    choiceToSave.nextNodeId = nodeIds[0]
+    choiceToSave.nextNodeTitle = cards[0]?.title ?? choiceToSave.nextNodeTitle
+    choiceToSave.nextNodeGoal = cards[0]?.goal ?? choiceToSave.nextNodeGoal
+    parentToSave.children = Array.from(new Set([...(parentToSave.children ?? []), nodeIds[0]]))
+    parentToSave.updatedAt = now
+
+    const pathRoute = galProject.routes.find((r) => r.id === selectedRouteId)
+    if (pathRoute && pathRoute.id !== route.id && Array.isArray(pathRoute.nodeIds)) {
+      pathRoute.nodeIds = Array.from(new Set([...pathRoute.nodeIds, ...nodeIds]))
+    }
+
+    await saveGalProject(project.path, galProject)
+    galStore.setProject(await loadGalProject(project.path))
+    galStore.selectNode(nodeIds[0])
+    return nodeIds
+  }, [project, route, node, selectedRouteId, galStore])
+
   const attachDirectChildNode = useCallback(async (childNode: GalNode) => {
     if (!project || !route || !node) return
     const galProject = await loadGalProject(project.path)
@@ -273,6 +481,10 @@ export function GalNodeEditor({
     const parentToSave = routeToSave?.nodes.find((n) => n.id === node.id)
     if (!galProject || !routeToSave || !parentToSave) {
       throw new Error("创建后续节点失败：当前节点不存在")
+    }
+
+    if (routeToSave.nodes.some((item) => item.id === childNode.id)) {
+      throw new Error(`创建后续节点失败：节点 ID ${childNode.id} 已存在`)
     }
 
     parentToSave.children = Array.from(new Set([...(parentToSave.children ?? []), childNode.id]))
@@ -297,15 +509,22 @@ export function GalNodeEditor({
       setMessage("正在保存当前选项...")
       await saveDraft()
       setMessage("正在根据选项生成后续节点卡片...")
-      const card = await expandChildNodeCard({
-        projectPath: project.path,
-        routeId: route.id,
-        parentNodeId: node.id,
-        choiceId,
-      })
+      const card = await galStore.runAiTask(
+        {
+          title: `AI 展开节点：${node.title}`,
+          detail: "根据选项生成后续节点卡片...",
+        },
+        () => expandChildNodeCard({
+          projectPath: project.path,
+          routeId: route.id,
+          parentNodeId: node.id,
+          choiceId,
+        }),
+      )
       const now = new Date().toISOString()
+      const childId = createUniqueNodeId(route)
       await attachChildNode(choiceId, {
-        id: card.id,
+        id: childId,
         routeId: route.id,
         title: card.title,
         type: card.type,
@@ -314,7 +533,7 @@ export function GalNodeEditor({
         children: [],
         goal: card.goal,
         summary: card.summary,
-        scriptPath: `nodes/${route.id}/${card.id}.md`,
+        scriptPath: `nodes/${route.id}/${childId}.md`,
         incomingState: node.outgoingState || createEmptyState(),
         choices: card.choices,
         memoryScope: "node",
@@ -329,9 +548,78 @@ export function GalNodeEditor({
     } catch (err) {
       setMessage(`AI 展开失败: ${err instanceof Error ? err.message : "未知错误"}`)
     } finally {
+      if (!useGalStore.getState().selectedNodeId) {
+        galStore.selectRoute(route.id)
+        galStore.selectNode(node.id)
+      }
       setExpanding(null)
     }
-  }, [project, route, node, saveDraft, attachChildNode])
+  }, [project, route, node, saveDraft, attachChildNode, galStore])
+
+  const handleGenerateLongLine = useCallback(async (choiceId: string, nodeCount: number, prompt: string, withScript: boolean) => {
+    if (!project || !route || !node) return
+    setExpanding(choiceId)
+    setMessage(null)
+    try {
+      setMessage("正在保存当前选项...")
+      await saveDraft()
+      const cards = await galStore.runAiTask(
+        {
+          title: `生成长线剧情：${node.title}`,
+          detail: `基于当前选项生成 ${nodeCount} 个连续节点...`,
+        },
+        () => generateChoiceLongLineCards({
+          projectPath: project.path,
+          routeId: route.id,
+          parentNodeId: node.id,
+          choiceId,
+          nodeCount,
+          userPrompt: prompt,
+        }),
+      )
+      const nodeIds = await attachChoiceLongLine(choiceId, cards)
+      if (withScript && nodeIds.length > 0) {
+        for (let index = 0; index < nodeIds.length; index += 1) {
+          const nodeId = nodeIds[index]
+          galStore.setGenerating(true, nodeId)
+          try {
+            await galStore.runAiTask(
+              {
+                title: `生成长线正文：${cards[index]?.title || `节点${index + 1}`}`,
+                detail: `正在生成第 ${index + 1}/${nodeIds.length} 个长线节点正文...`,
+              },
+              () => generateNodeScript({
+                projectPath: project.path,
+                routeId: route.id,
+                nodeId,
+                userPrompt: buildLongLineScriptPrompt({
+                  cards,
+                  index,
+                  userPrompt: prompt,
+                  parentTitle: node.title,
+                }),
+                onToken: () => {},
+              }),
+            )
+          } finally {
+            galStore.setGenerating(false, nodeId)
+          }
+        }
+        galStore.setProject(await loadGalProject(project.path))
+      }
+      setMessage(withScript
+        ? `已生成 ${cards.length} 个连续剧情节点，并已补完正文。`
+        : `已生成 ${cards.length} 个连续剧情节点。`)
+    } catch (err) {
+      if (!useGalStore.getState().selectedNodeId) {
+        galStore.selectRoute(route.id)
+        galStore.selectNode(node.id)
+      }
+      setMessage(`长线剧情生成失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    } finally {
+      setExpanding(null)
+    }
+  }, [project, route, node, saveDraft, attachChoiceLongLine, galStore])
 
   const handleManualExpandChild = useCallback(async (choiceId: string) => {
     if (!project || !route || !node) return
@@ -342,7 +630,7 @@ export function GalNodeEditor({
       await saveDraft()
       const choice = draftChoices.find((item) => item.id === choiceId)
       const now = new Date().toISOString()
-      const childId = `node_${Date.now().toString(36)}`
+      const childId = createUniqueNodeId(route)
       await attachChildNode(choiceId, {
         id: childId,
         routeId: route.id,
@@ -381,7 +669,7 @@ export function GalNodeEditor({
       setMessage("正在创建默认后续空节点...")
       await saveDraft()
       const now = new Date().toISOString()
-      const childId = `node_${Date.now().toString(36)}`
+      const childId = createUniqueNodeId(route)
       await attachDirectChildNode({
         id: childId,
         routeId: route.id,
@@ -481,6 +769,79 @@ export function GalNodeEditor({
     }
   }, [project, route, node, saveDraft, galStore])
 
+  const handleUnlinkChoice = useCallback(async (choiceId: string) => {
+    if (!project || !route || !node) return
+    setExpanding(choiceId)
+    setMessage(null)
+    try {
+      await saveDraft()
+      const galProject = await loadGalProject(project.path)
+      const routeToSave = galProject?.routes.find((r) => r.id === route.id)
+      const parentToSave = routeToSave?.nodes.find((n) => n.id === node.id)
+      const choiceToSave = parentToSave?.choices.find((choice) => choice.id === choiceId)
+      const targetNodeId = choiceToSave?.nextNodeId
+      if (!galProject || !routeToSave || !parentToSave || !choiceToSave || !targetNodeId) {
+        throw new Error("解除失败：当前链接不存在")
+      }
+
+      choiceToSave.nextNodeId = undefined
+      const remainsLinked = parentToSave.choices.some((choice) => choice.nextNodeId === targetNodeId)
+      if (!remainsLinked) {
+        parentToSave.children = (parentToSave.children ?? []).filter((childId) => childId !== targetNodeId)
+        const targetToSave = routeToSave.nodes.find((item) => item.id === targetNodeId)
+        if (targetToSave) {
+          targetToSave.parents = (targetToSave.parents ?? []).filter((parentId) => parentId !== node.id)
+          targetToSave.updatedAt = new Date().toISOString()
+        }
+      }
+      parentToSave.updatedAt = new Date().toISOString()
+      await saveGalProject(project.path, galProject)
+      const refreshed = await loadGalProject(project.path)
+      galStore.setProject(refreshed)
+      const refreshedNode = refreshed?.routes
+        .find((item) => item.id === route.id)
+        ?.nodes.find((item) => item.id === node.id)
+      if (refreshedNode) setDraftChoices(cloneChoices(refreshedNode.choices ?? []))
+      setMessage("选项链接已解除，原后继节点仍然保留。")
+    } catch (err) {
+      setMessage(`解除链接失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    } finally {
+      setExpanding(null)
+    }
+  }, [project, route, node, saveDraft, galStore])
+
+  const handleUnlinkDefaultOutlet = useCallback(async (targetNodeId: string) => {
+    if (!project || !route || !node) return
+    const expandKey = "__default__"
+    setExpanding(expandKey)
+    setMessage(null)
+    try {
+      await saveDraft()
+      const galProject = await loadGalProject(project.path)
+      const routeToSave = galProject?.routes.find((r) => r.id === route.id)
+      const parentToSave = routeToSave?.nodes.find((n) => n.id === node.id)
+      const targetToSave = routeToSave?.nodes.find((n) => n.id === targetNodeId)
+      if (!galProject || !routeToSave || !parentToSave || !targetToSave) {
+        throw new Error("解除失败：当前链接或目标节点不存在")
+      }
+
+      parentToSave.children = (parentToSave.children ?? []).filter((childId) => childId !== targetNodeId)
+      const remainsLinked = parentToSave.choices.some((choice) => choice.nextNodeId === targetNodeId)
+      if (!remainsLinked) {
+        targetToSave.parents = (targetToSave.parents ?? []).filter((parentId) => parentId !== node.id)
+      }
+      parentToSave.updatedAt = new Date().toISOString()
+      targetToSave.updatedAt = new Date().toISOString()
+      await saveGalProject(project.path, galProject)
+      galStore.setProject(await loadGalProject(project.path))
+      setMessage("默认出口链接已解除，原后继节点仍然保留。")
+    } catch (err) {
+      setMessage(`解除链接失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    } finally {
+      setExpanding(null)
+    }
+  }, [project, route, node, saveDraft, galStore])
+
   const handleDeleteNode = useCallback(async () => {
     if (!project || !route || !node) return
     if (!window.confirm(`确定删除节点「${node.title}」吗？该节点正文也会被删除。`)) return
@@ -529,6 +890,48 @@ export function GalNodeEditor({
     )
   }, [])
 
+  const handleCreateVariable = useCallback(async (
+    choiceId: string,
+    variableIdInput: string,
+    variableNameInput: string,
+  ): Promise<boolean> => {
+    if (!project) return false
+    const variableId = variableIdInput.trim()
+    const variableName = variableNameInput.trim() || variableId
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(variableId)) {
+      setMessage("变量 ID 只能使用英文字母、数字和下划线，并且必须以字母开头。")
+      return false
+    }
+
+    try {
+      const galProject = await loadGalProject(project.path)
+      if (!galProject) {
+        setMessage("创建变量失败：Gal 项目不存在。")
+        return false
+      }
+      if (galProject.variables.some((variable) => variable.id === variableId)) {
+        setMessage(`变量 ${variableId} 已存在，请直接选择已有变量。`)
+        return false
+      }
+
+      galProject.variables.push({
+        id: variableId,
+        name: variableName,
+        type: "custom",
+        defaultValue: 0,
+        description: "用户手动创建的变量",
+      })
+      await saveGalProject(project.path, galProject)
+      galStore.setProject(await loadGalProject(project.path))
+      updateChoice(choiceId, { effects: [createAddEffect(variableId, "+", 1)] })
+      setMessage(`变量 ${variableName} (${variableId}) 已创建并绑定到当前选项。`)
+      return true
+    } catch (error) {
+      setMessage(`创建变量失败：${error instanceof Error ? error.message : "未知错误"}`)
+      return false
+    }
+  }, [project, galStore, updateChoice])
+
   const addChoice = useCallback(() => {
     setDraftChoices((choices) => [
       ...choices,
@@ -542,6 +945,41 @@ export function GalNodeEditor({
       },
     ])
   }, [])
+
+  const handleGenerateChoices = useCallback(async (count: number) => {
+    setGeneratingChoices(true)
+    setShowChoiceCountPicker(false)
+    setMessage(null)
+    try {
+      setMessage(`正在生成 ${count} 个选项...`)
+      const generatedChoices = await galStore.runAiTask(
+        {
+          title: `生成选项：${draftTitle || node?.title || "当前节点"}`,
+          detail: `调用 AI 生成 ${count} 个选项...`,
+        },
+        () => generateNodeChoices({
+          count,
+          projectPath: project?.path,
+          routeId: route?.id,
+          nodeId: node?.id,
+          title: draftTitle,
+          characters: draftCharacters,
+          goal: draftGoal,
+          scene: draftScene,
+          scriptContent,
+          choicePrompt,
+          existingChoices: draftChoices,
+        }),
+      )
+      setDraftChoices((choices) => [...choices, ...generatedChoices])
+      await saveDraft(undefined, [...draftChoices, ...generatedChoices])
+      setMessage(`已生成 ${generatedChoices.length} 个选项，并已自动保存到节点。`)
+    } catch (err) {
+      setMessage(`选项生成失败: ${err instanceof Error ? err.message : "未知错误"}`)
+    } finally {
+      setGeneratingChoices(false)
+    }
+  }, [project?.path, route?.id, node?.id, node?.title, draftTitle, draftCharacters, draftGoal, draftScene, scriptContent, choicePrompt, draftChoices, saveDraft, galStore])
 
   const removeChoice = useCallback((choiceId: string) => {
     setDraftChoices((choices) => choices.filter((choice) => choice.id !== choiceId))
@@ -614,6 +1052,34 @@ export function GalNodeEditor({
         <div className="mb-3 space-y-1.5">
           <div className="flex items-center gap-2">
             <div className="flex-1 text-xs font-medium text-muted-foreground">选项</div>
+            <input
+              value={choicePrompt}
+              onChange={(event) => setChoicePrompt(event.target.value)}
+              placeholder="选项生成提示词"
+              className="h-7 w-56 rounded-md border bg-background px-2 text-[11px] focus:outline-none focus:ring-2 focus:ring-primary/20"
+            />
+            {showChoiceCountPicker && (
+              <select
+                value=""
+                disabled={generatingChoices}
+                onChange={(event) => {
+                  const count = Number(event.target.value)
+                  event.currentTarget.value = ""
+                  if (count > 0) void handleGenerateChoices(count)
+                }}
+                className="h-7 rounded-md border bg-background px-2 text-[11px] focus:outline-none focus:ring-2 focus:ring-primary/20"
+              >
+                <option value="">选择数量</option>
+                <option value="1">生成 1 个</option>
+                <option value="2">生成 2 个</option>
+                <option value="3">生成 3 个</option>
+                <option value="4">生成 4 个</option>
+              </select>
+            )}
+            <button type="button" disabled={generatingChoices} onClick={() => setShowChoiceCountPicker((value) => !value)} className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
+              {generatingChoices ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+              AI 生成选项
+            </button>
             <button type="button" onClick={addChoice} className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] hover:bg-accent">
               <Plus className="h-3 w-3" />
               添加选项
@@ -626,12 +1092,16 @@ export function GalNodeEditor({
                 choice={choice}
                 expanding={expanding === choice.id}
                 mergeTargets={mergeTargets}
+                variables={galStore.project?.variables ?? []}
+                variablePreview={buildChoiceVariablePreview(choice, node, galStore.project?.variables ?? [])}
                 onChange={updateChoice}
-                onEffectsChange={(choiceId, effectsText) => updateChoice(choiceId, { effects: parseEffectsText(effectsText) })}
+                onCreateVariable={handleCreateVariable}
                 onRemove={() => removeChoice(choice.id)}
                 onAiExpand={() => handleAiExpandChild(choice.id)}
+                onGenerateLongLine={(count, prompt, withScript) => handleGenerateLongLine(choice.id, count, prompt, withScript)}
                 onManualExpand={() => handleManualExpandChild(choice.id)}
                 onMergeExisting={(targetNodeId) => handleMergeToExisting(choice.id, targetNodeId)}
+                onUnlink={() => handleUnlinkChoice(choice.id)}
               />
             ))
           ) : (
@@ -641,6 +1111,7 @@ export function GalNodeEditor({
               mergeTargets={mergeTargets}
               onManualExpand={handleDefaultManualExpand}
               onMergeExisting={handleDefaultMergeToExisting}
+              onUnlink={handleUnlinkDefaultOutlet}
             />
           )}
         </div>
@@ -668,23 +1139,35 @@ export function GalNodeEditor({
       </div>
 
       <div className="flex items-center gap-1.5 border-t px-3 py-2">
-        <button type="button" disabled={galStore.generating || Boolean(scriptContent.trim())} onClick={handleFirstGenerate} className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
-          {galStore.generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+        <button type="button" disabled={currentNodeGenerating || Boolean(scriptContent.trim())} onClick={handleFirstGenerate} className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+          {currentNodeGenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
           首次生成
         </button>
-        <button type="button" disabled={galStore.generating || !scriptContent.trim()} onClick={handleRegenerate} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
-          {galStore.generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+        <button type="button" disabled={currentNodeGenerating || !scriptContent.trim()} onClick={handleRegenerate} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
+          {currentNodeGenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
           重新生成
         </button>
         <button type="button" disabled={saving} onClick={handleSaveDraft} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
           {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
           保存
         </button>
+        <button type="button" disabled={saving || summarizing} onClick={handleUpdateSummary} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
+          {summarizing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+          更新摘要
+        </button>
+        <button type="button" disabled={saving || !scriptContent} onClick={handleBackfillIncomingChoices} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
+          <Link2 className="h-3.5 w-3.5" />
+          回写选项
+        </button>
         <button type="button" disabled={saving || !scriptContent} onClick={handleSaveAndIngest} className="inline-flex items-center gap-1 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 disabled:opacity-50">
           {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
           保存并摄取
         </button>
         <div className="flex-1" />
+        <button type="button" disabled={!node} onClick={() => node && onOpenLonglineWorkspace?.(node.id)} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
+          <MapIcon className="h-3.5 w-3.5" />
+          长线检查
+        </button>
         <button type="button" disabled={lintRunning} onClick={onLintBranch} className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">
           {lintRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
           分支检查
@@ -700,12 +1183,14 @@ function DefaultOutletPanel({
   mergeTargets,
   onManualExpand,
   onMergeExisting,
+  onUnlink,
 }: {
   expanding: boolean
   linkedNodes: GalNode[]
   mergeTargets: GalNode[]
   onManualExpand: () => void
   onMergeExisting: (targetNodeId: string) => void
+  onUnlink: (targetNodeId: string) => void
 }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/20 p-3 text-xs text-muted-foreground">
@@ -713,8 +1198,22 @@ function DefaultOutletPanel({
         当前没有预设选项。AI 生成时会自由发挥，也可以通过默认出口连接一个后续节点。
       </div>
       {linkedNodes.length > 0 ? (
-        <div className="mt-2 rounded border bg-background/60 px-2 py-1.5 text-[11px]">
-          默认出口已连接：{linkedNodes.map((item) => item.title).join("、")}
+        <div className="mt-2 space-y-1">
+          {linkedNodes.map((item) => (
+            <div key={item.id} className="flex items-center gap-2 rounded border bg-background/60 px-2 py-1.5 text-[11px]">
+              <span className="min-w-0 flex-1 truncate">默认出口已连接：{item.title}</span>
+              <button
+                type="button"
+                disabled={expanding}
+                onClick={() => onUnlink(item.id)}
+                className="inline-flex shrink-0 items-center gap-1 rounded border px-2 py-1 text-[10px] hover:bg-accent disabled:opacity-50"
+                title="解除链接，不删除节点"
+              >
+                <Unlink className="h-3 w-3" />
+                解除链接
+              </button>
+            </div>
+          ))}
         </div>
       ) : (
         <div className="mt-2 flex flex-wrap items-center gap-1">
@@ -752,23 +1251,52 @@ function ChoiceItem({
   choice,
   expanding,
   mergeTargets,
+  variables,
+  variablePreview,
   onChange,
-  onEffectsChange,
+  onCreateVariable,
   onRemove,
   onAiExpand,
+  onGenerateLongLine,
   onManualExpand,
   onMergeExisting,
+  onUnlink,
 }: {
   choice: GalChoice
   expanding: boolean
   mergeTargets: GalNode[]
+  variables: GalVariable[]
+  variablePreview: string
   onChange: (choiceId: string, patch: Partial<GalChoice>) => void
-  onEffectsChange: (choiceId: string, effectsText: string) => void
+  onCreateVariable: (choiceId: string, variableId: string, variableName: string) => Promise<boolean>
   onRemove: () => void
   onAiExpand: () => void
+  onGenerateLongLine: (count: number, prompt: string, withScript: boolean) => void
   onManualExpand: () => void
   onMergeExisting: (targetNodeId: string) => void
+  onUnlink: () => void
 }) {
+  const primaryEffect = choice.effects[0]
+  const knownVariableIds = new Set(variables.map((variable) => variable.id))
+  const canUseExistingVariable = variables.length > 0
+  const initialVariableMode = primaryEffect && knownVariableIds.has(primaryEffect.variable)
+    ? "existing"
+    : "none"
+  const [variableMode, setVariableMode] = useState<"none" | "existing" | "manual">(initialVariableMode)
+  const [newVariableId, setNewVariableId] = useState("")
+  const [newVariableName, setNewVariableName] = useState("")
+  const [creatingVariable, setCreatingVariable] = useState(false)
+  const [showLongLinePanel, setShowLongLinePanel] = useState(false)
+  const [longLineCount, setLongLineCount] = useState(5)
+  const [longLinePrompt, setLongLinePrompt] = useState("")
+  const [longLineWithScript, setLongLineWithScript] = useState(true)
+  const selectedVariableId = primaryEffect && knownVariableIds.has(primaryEffect.variable)
+    ? primaryEffect.variable
+    : (variables[0]?.id ?? "")
+  const numericEffectValue = Number(primaryEffect?.value ?? 1)
+  const effectSign = Number.isFinite(numericEffectValue) && numericEffectValue < 0 ? "-" : "+"
+  const effectAmount = Number.isFinite(numericEffectValue) ? Math.abs(numericEffectValue) : 1
+
   return (
     <div className="rounded-md border bg-background p-2 text-xs">
       <div className="flex items-start gap-2">
@@ -782,14 +1310,120 @@ function ChoiceItem({
             <input value={choice.emotionalIntent} onChange={(event) => onChange(choice.id, { emotionalIntent: event.target.value })} className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20" />
           </label>
           <label className="min-w-0">
-            <span className="mb-1 block text-[10px] text-muted-foreground">变量影响</span>
-            <input value={effectsToText(choice.effects)} onChange={(event) => onEffectsChange(choice.id, event.target.value)} placeholder="feiai_trust +1" className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20" />
+            <span className="mb-1 block text-[10px] text-muted-foreground">内部变量影响（不注入 AI）</span>
+            <select
+              value={variableMode}
+              onChange={(event) => {
+                const mode = event.target.value as "none" | "existing" | "manual"
+                setVariableMode(mode)
+                if (mode === "none" || mode === "manual") {
+                  onChange(choice.id, { effects: [] })
+                } else if (variables[0]) {
+                  onChange(choice.id, { effects: [createAddEffect(variables[0].id, "+", 1)] })
+                }
+              }}
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            >
+              <option value="none">无变量影响</option>
+              <option value="existing" disabled={!canUseExistingVariable}>已有变量叠加</option>
+              <option value="manual">人工创建新变量</option>
+            </select>
           </label>
         </div>
         <button type="button" onClick={onRemove} className="mt-4 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-destructive/30 text-destructive hover:bg-destructive/10" title="删除选项">
           <Trash2 className="h-3.5 w-3.5" />
         </button>
       </div>
+      <div className="mt-1.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-300">
+        {variablePreview}
+      </div>
+      {variableMode === "existing" && canUseExistingVariable ? (
+        <div className="mt-2 grid gap-2 rounded border bg-muted/20 p-2 md:grid-cols-[1fr_80px_120px]">
+          <label className="min-w-0">
+            <span className="mb-1 block text-[10px] text-muted-foreground">变量</span>
+            <select
+              value={selectedVariableId}
+              onChange={(event) => onChange(choice.id, {
+                effects: [createAddEffect(event.target.value, effectSign, effectAmount)],
+              })}
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            >
+              {variables.map((variable) => (
+                <option key={variable.id} value={variable.id}>
+                  {variable.name} ({variable.id})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="min-w-0">
+            <span className="mb-1 block text-[10px] text-muted-foreground">加减</span>
+            <select
+              value={effectSign}
+              onChange={(event) => onChange(choice.id, {
+                effects: [createAddEffect(selectedVariableId, event.target.value === "-" ? "-" : "+", effectAmount)],
+              })}
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            >
+              <option value="+">+</option>
+              <option value="-">-</option>
+            </select>
+          </label>
+          <label className="min-w-0">
+            <span className="mb-1 block text-[10px] text-muted-foreground">数值</span>
+            <input
+              type="number"
+              min="0"
+              step="1"
+              value={String(effectAmount)}
+              onChange={(event) => onChange(choice.id, {
+                effects: [createAddEffect(selectedVariableId, effectSign, Number(event.target.value || 0))],
+              })}
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            />
+          </label>
+        </div>
+      ) : variableMode === "manual" ? (
+        <div className="mt-2 grid gap-2 rounded border bg-muted/20 p-2 md:grid-cols-[1fr_1fr_auto]">
+          <label className="min-w-0">
+            <span className="mb-1 block text-[10px] text-muted-foreground">变量 ID</span>
+            <input
+              value={newVariableId}
+              onChange={(event) => setNewVariableId(event.target.value)}
+              placeholder="例如 trust"
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            />
+          </label>
+          <label className="min-w-0">
+            <span className="mb-1 block text-[10px] text-muted-foreground">显示名称</span>
+            <input
+              value={newVariableName}
+              onChange={(event) => setNewVariableName(event.target.value)}
+              placeholder="例如 信任度"
+              className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={creatingVariable || !newVariableId.trim()}
+            onClick={async () => {
+              setCreatingVariable(true)
+              try {
+                if (await onCreateVariable(choice.id, newVariableId, newVariableName)) {
+                  setVariableMode("existing")
+                  setNewVariableId("")
+                  setNewVariableName("")
+                }
+              } finally {
+                setCreatingVariable(false)
+              }
+            }}
+            className="mt-4 inline-flex h-8 items-center gap-1 rounded border px-2 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            {creatingVariable ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+            创建变量
+          </button>
+        </div>
+      ) : null}
       <div className="mt-2 flex items-center gap-2">
         <label className="min-w-0 flex-1">
           <span className="mb-1 block text-[10px] text-muted-foreground">下个节点建议标题</span>
@@ -804,11 +1438,32 @@ function ChoiceItem({
         <div className="truncate text-[10px] text-muted-foreground">
           {choice.nextNodeId ? `已连接：${choice.nextNodeId}` : "尚未连接后续节点"}
         </div>
-        {!choice.nextNodeId && (
+        {choice.nextNodeId ? (
+          <button
+            type="button"
+            disabled={expanding}
+            onClick={onUnlink}
+            className="inline-flex shrink-0 items-center gap-1 rounded border px-2 py-1 text-[10px] hover:bg-accent disabled:opacity-50"
+            title="解除链接，不删除节点"
+          >
+            {expanding ? <Loader2 className="h-3 w-3 animate-spin" /> : <Unlink className="h-3 w-3" />}
+            解除链接
+          </button>
+        ) : (
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
             <button type="button" disabled={expanding} onClick={onAiExpand} className="inline-flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] hover:bg-accent/80 disabled:opacity-50">
               {expanding ? <Loader2 className="h-3 w-3 animate-spin" /> : <GitBranchPlus className="h-3 w-3" />}
               AI 展开
+            </button>
+            <button
+              type="button"
+              disabled={expanding}
+              onClick={() => setShowLongLinePanel((value) => !value)}
+              className="inline-flex items-center gap-1 rounded border px-2 py-1 text-[10px] hover:bg-accent disabled:opacity-50"
+              title="生成一条连续剧情线"
+            >
+              {expanding ? <Loader2 className="h-3 w-3 animate-spin" /> : <ListPlus className="h-3 w-3" />}
+              长线
             </button>
             <button type="button" disabled={expanding} onClick={onManualExpand} className="inline-flex items-center gap-1 rounded border px-2 py-1 text-[10px] hover:bg-accent disabled:opacity-50">
               <Plus className="h-3 w-3" />
@@ -837,6 +1492,53 @@ function ChoiceItem({
           </div>
         )}
       </div>
+      {!choice.nextNodeId && showLongLinePanel && (
+        <div className="mt-2 rounded border bg-muted/20 p-2">
+          <div className="grid gap-2 md:grid-cols-[120px_1fr_120px_auto]">
+            <label className="min-w-0">
+              <span className="mb-1 block text-[10px] text-muted-foreground">节点数</span>
+              <select
+                value={String(longLineCount)}
+                disabled={expanding}
+                onChange={(event) => setLongLineCount(Number(event.target.value))}
+                className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+              >
+                <option value="3">3 个节点</option>
+                <option value="5">5 个节点</option>
+                <option value="8">8 个节点</option>
+              </select>
+            </label>
+            <label className="min-w-0">
+              <span className="mb-1 block text-[10px] text-muted-foreground">长线提示词</span>
+              <input
+                value={longLinePrompt}
+                disabled={expanding}
+                onChange={(event) => setLongLinePrompt(event.target.value)}
+                placeholder="例如：偏甜蜜、慢慢升温、不要马上收束"
+                className="h-8 w-full rounded border bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </label>
+            <label className="mt-4 inline-flex h-8 items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={longLineWithScript}
+                disabled={expanding}
+                onChange={(event) => setLongLineWithScript(event.target.checked)}
+              />
+              生成正文
+            </label>
+            <button
+              type="button"
+              disabled={expanding}
+              onClick={() => onGenerateLongLine(longLineCount, longLinePrompt, longLineWithScript)}
+              className="mt-4 inline-flex h-8 items-center gap-1 rounded bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {expanding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ListPlus className="h-3.5 w-3.5" />}
+              生成长线
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -849,34 +1551,85 @@ function cloneChoices(choices: GalChoice[]): GalChoice[] {
   }))
 }
 
-function effectsToText(effects: GalEffect[] = []): string {
-  return effects
-    .map((effect) => `${effect.variable} ${effect.op === "add" ? "+" : "="}${String(effect.value)}`)
-    .join("; ")
+function buildLongLineScriptPrompt({
+  cards,
+  index,
+  userPrompt,
+  parentTitle,
+}: {
+  cards: ChildNodeCardResult[]
+  index: number
+  userPrompt: string
+  parentTitle: string
+}): string {
+  const current = cards[index]
+  const previous = cards[index - 1]
+  const next = cards[index + 1]
+  const plan = cards.map((card, cardIndex) => {
+    return `${cardIndex + 1}. ${card.title}：${card.goal || card.summary || "推进连续剧情"}`
+  }).join("\n")
+  return [
+    "## 长线剧情生成约束（最高优先级）",
+    `这是从「${parentTitle}」的某个选项出发生成的一条单线长剧情。`,
+    `当前正在写第 ${index + 1}/${cards.length} 个节点：${current?.title ?? ""}`,
+    "",
+    "## 整条长线计划",
+    plan,
+    "",
+    previous
+      ? `## 上一个节点\n标题：${previous.title}\n目标：${previous.goal || "（无）"}\n摘要：${previous.summary || "（无）"}`
+      : "## 上一个节点\n本节点是长线起点，必须直接承接父节点结尾和玩家选项。",
+    "",
+    next
+      ? `## 下一个节点\n标题：${next.title}\n目标：${next.goal || "（无）"}\n摘要：${next.summary || "（无）"}\n正文结尾必须自然导向唯一继续选项，不要写成分叉。`
+      : "## 下一个节点\n本节点是当前长线末端。不要生成新的分叉选项，不要写成最终结局，保持后续可继续推进。",
+    "",
+    "## 单线硬规则",
+    "1. 只写当前节点正文，不要替其他节点写正文。",
+    "2. 不要在正文中新增分叉、多个选择、选项列表或变量说明。",
+    "3. 中间节点结尾必须自然导向唯一继续选项。",
+    "4. 末端节点保持可继续，不要强行收尾成结局，除非用户提示词明确要求。",
+    "5. 不要创造新的核心人物、地点或设定；必须沿用项目上下文。",
+    userPrompt.trim() ? `\n## 用户对这条长线的提示词\n${userPrompt.trim()}` : "",
+  ].filter(Boolean).join("\n")
 }
 
-function parseEffectsText(text: string): GalEffect[] {
-  return text
-    .split(/[;\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((item) => {
-      const match = item.match(/^(.+?)\s*(\+|=)\s*(.+)$/)
-      if (!match) return null
-      return {
-        variable: match[1].trim(),
-        op: match[2] === "+" ? "add" : "set",
-        value: parseEffectValue(match[3].trim()),
-      } satisfies GalEffect
-    })
-    .filter((effect): effect is GalEffect => Boolean(effect))
+function createAddEffect(variableId: string, sign: "+" | "-", amount: number): GalEffect {
+  const safeAmount = Number.isFinite(amount) ? Math.abs(amount) : 0
+  return {
+    variable: variableId.trim(),
+    op: "add",
+    value: sign === "-" ? -safeAmount : safeAmount,
+  }
 }
 
-function parseEffectValue(value: string): number | string | boolean {
-  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value)
-  if (value === "true") return true
-  if (value === "false") return false
-  return value
+function buildChoiceVariablePreview(choice: GalChoice, node: GalNode, variables: GalVariable[]): string {
+  if (choice.effects.length === 0) return "变量预览：不会改变变量"
+  const base = node.incomingState?.variables ?? {}
+  const variableMap = new Map(variables.map((variable) => [variable.id, variable]))
+  return `变量预览（仅统计，不写入 AI）：${choice.effects.map((effect) => {
+    const variable = variableMap.get(effect.variable)
+    const current = base[effect.variable] ?? variable?.defaultValue ?? 0
+    const next = applyEffectValue(current, effect)
+    const label = variable?.name ? `${variable.name}(${effect.variable})` : effect.variable
+    return `${label}: ${String(current)} -> ${String(next)}`
+  }).join("；")}`
+}
+
+function applyChoiceEffectsToState(state: GalStateSnapshot, effects: GalEffect[]): GalStateSnapshot {
+  const variables = { ...state.variables }
+  for (const effect of effects) {
+    variables[effect.variable] = applyEffectValue(variables[effect.variable] ?? 0, effect)
+  }
+  return { ...state, variables }
+}
+
+function applyEffectValue(current: number | string | boolean, effect: GalEffect): number | string | boolean {
+  if (effect.op === "set") return effect.value
+  const currentNumber = Number(current ?? 0)
+  const delta = Number(effect.value)
+  if (!Number.isFinite(currentNumber) || !Number.isFinite(delta)) return effect.value
+  return currentNumber + delta
 }
 
 function splitCharacters(value: string): string[] {
@@ -886,7 +1639,7 @@ function splitCharacters(value: string): string[] {
     .filter(Boolean)
 }
 
-function createEmptyState() {
+function createEmptyState(): GalStateSnapshot {
   return {
     variables: {},
     characterCognition: {},
@@ -900,6 +1653,15 @@ function createEmptyState() {
 
 function getNextSequence(route: GalRoute): number {
   return Math.max(0, ...(route.nodes ?? []).map((item) => item.sequence || 0)) + 1
+}
+
+function createUniqueNodeId(route: GalRoute): string {
+  const existingIds = new Set((route.nodes ?? []).map((item) => item.id))
+  let nodeId = ""
+  do {
+    nodeId = `node_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  } while (existingIds.has(nodeId))
+  return nodeId
 }
 
 function getMergeTargets(route: GalRoute, source: GalNode): GalNode[] {
@@ -927,16 +1689,18 @@ function computeDepths(route: GalRoute): Map<string, number> {
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const depths = new Map<string, number>()
   const queue = [{ id: route.entryNodeId || nodes[0]?.id, depth: 0 }]
+  const maxDepth = Math.max(0, nodes.length - 1)
   while (queue.length > 0) {
     const item = queue.shift()
     if (!item?.id) continue
     const previous = depths.get(item.id)
-    if (previous !== undefined && previous <= item.depth) continue
-    depths.set(item.id, item.depth)
+    const nextDepth = Math.min(item.depth, maxDepth)
+    if (previous !== undefined && previous >= nextDepth) continue
+    depths.set(item.id, nextDepth)
     const node = nodeById.get(item.id)
     if (!node) continue
     for (const childId of collectNextNodeIds(node)) {
-      queue.push({ id: childId, depth: item.depth + 1 })
+      if (nextDepth < maxDepth) queue.push({ id: childId, depth: nextDepth + 1 })
     }
   }
   return depths

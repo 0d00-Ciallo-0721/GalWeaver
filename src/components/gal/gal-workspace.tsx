@@ -9,10 +9,14 @@ import { useGalStore } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { GalNodeEditor } from "./gal-node-editor"
 import { GalRouteBoard } from "./gal-route-board"
+import { GalLonglineWorkspace } from "./gal-longline-workspace"
+import { GalAiTaskToasts } from "./gal-ai-task-toasts"
 import { isEmptyProject } from "./gal-utils"
-import { isGalProject, loadGalProject } from "@/lib/gal/gal-storage"
+import { loadGalProject } from "@/lib/gal/gal-storage"
 import { lintBranchGraph } from "@/lib/gal/gal-branch-lint"
 import { buildGalInitContextPreview, initGalProject } from "@/lib/gal/gal-project-init"
+import { canRestoreGalProjectExport, restoreGalProjectFromExport } from "@/lib/gal/gal-export"
+import { isTauri, pickDirectory } from "@/lib/platform"
 
 export function GalWorkspace() {
   const project = useWikiStore((s) => s.project)
@@ -21,9 +25,12 @@ export function GalWorkspace() {
   const [initError, setInitError] = useState<string | null>(null)
   const [initContextPreview, setInitContextPreview] = useState<string | null>(null)
   const [loadingInitContext, setLoadingInitContext] = useState(false)
-  const [view, setView] = useState<"board" | "detail">("board")
+  const [restoringExport, setRestoringExport] = useState(false)
+  const [loadDebug, setLoadDebug] = useState<string | null>(null)
+  const [view, setView] = useState<"board" | "detail" | "longline">("board")
+  const [longlineStartNodeId, setLonglineStartNodeId] = useState<string | null>(null)
 
-  const isLoading = galStore.loading || initializing
+  const isLoading = galStore.loading || initializing || restoringExport
   const error = galStore.error || initError
 
   useEffect(() => {
@@ -33,6 +40,7 @@ export function GalWorkspace() {
   }, [galStore.project?.routes, galStore.selectedRouteId])
 
   useEffect(() => {
+    if (view === "longline") return
     const selectedRoute = galStore.project?.routes.find((route) => route.id === galStore.selectedRouteId)
     if (galStore.selectedNodeId && !Array.isArray(selectedRoute?.nodeIds)) {
       setView("detail")
@@ -40,7 +48,7 @@ export function GalWorkspace() {
     if (Array.isArray(selectedRoute?.nodeIds)) {
       setView("board")
     }
-  }, [galStore.project?.routes, galStore.selectedRouteId, galStore.selectedNodeId])
+  }, [galStore.project?.routes, galStore.selectedRouteId, galStore.selectedNodeId, view])
 
   useEffect(() => {
     if (!project?.path) return
@@ -49,15 +57,24 @@ export function GalWorkspace() {
     const load = async () => {
       galStore.setLoading(true)
       try {
-        const exists = await isGalProject(project.path)
+        const galProject = await loadGalProject(project.path)
         if (cancelled) return
-        if (exists) {
-          const galProject = await loadGalProject(project.path)
-          if (!cancelled) galStore.setProject(galProject)
+        galStore.setProject(galProject)
+        setLoadDebug(
+          galProject
+            ? `路径：${project.path}；Tauri：${isTauri() ? "是" : "否"}；线路：${galProject.routes.length}；节点：${galProject.routes.reduce((sum, route) => sum + (route.nodes?.length ?? 0), 0)}`
+            : `路径：${project.path}；Tauri：${isTauri() ? "是" : "否"}；未读取到 .gal/project.json`,
+        )
+        if (!galProject) {
+          galStore.selectRoute(null)
+          galStore.selectNode(null)
+          setView("board")
         }
       } catch (err) {
         if (!cancelled) {
-          galStore.setError(err instanceof Error ? err.message : "鍔犺浇澶辫触")
+          const message = err instanceof Error ? err.message : "鍔犺浇澶辫触"
+          setLoadDebug(`路径：${project.path}；Tauri：${isTauri() ? "是" : "否"}；错误：${message}`)
+          galStore.setError(message)
         }
       } finally {
         if (!cancelled) galStore.setLoading(false)
@@ -74,10 +91,16 @@ export function GalWorkspace() {
     setInitializing(true)
     setInitError(null)
     try {
-      const galProject = await initGalProject({
-        projectPath: project.path,
-        title: project.name || "未命名 Gal 项目",
-      })
+      const galProject = await galStore.runAiTask(
+        {
+          title: "初始化 Gal 项目",
+          detail: "调用 AI 生成线路骨架和入口节点...",
+        },
+        () => initGalProject({
+          projectPath: project.path,
+          title: project.name || "未命名 Gal 项目",
+        }),
+      )
       galStore.setProject(galProject)
     } catch (err) {
       const detail = err instanceof Error
@@ -102,10 +125,16 @@ export function GalWorkspace() {
     try {
       galStore.selectNode(null)
       galStore.selectRoute(null)
-      const galProject = await initGalProject({
-        projectPath: project.path,
-        title: project.name || "未命名 Gal 项目",
-      })
+      const galProject = await galStore.runAiTask(
+        {
+          title: "重新初始化 Gal 项目",
+          detail: "调用 AI 重新生成线路骨架和入口节点...",
+        },
+        () => initGalProject({
+          projectPath: project.path,
+          title: project.name || "未命名 Gal 项目",
+        }),
+      )
       galStore.setProject(galProject)
       const firstRoute = galProject.routes[0]
       if (firstRoute) {
@@ -148,6 +177,38 @@ export function GalWorkspace() {
     }
   }, [project])
 
+  const handleRestoreFromExport = useCallback(async (exportPath?: string) => {
+    if (!project) return
+    setRestoringExport(true)
+    setInitError(null)
+    try {
+      const sourcePath = exportPath ?? project.path
+      if (!(await canRestoreGalProjectExport(sourcePath))) {
+        throw new Error("请选择包含 graph.json 和“节点正文”目录的线路导出文件夹。")
+      }
+      const result = await restoreGalProjectFromExport(project.path, sourcePath)
+      const restored = await loadGalProject(project.path)
+      galStore.setProject(restored)
+      const firstRoute = restored?.routes[0]
+      if (firstRoute) {
+        galStore.selectRoute(firstRoute.id)
+        galStore.selectNode(null)
+        setView("board")
+      }
+      setInitContextPreview(`已恢复 ${result.nodeCount} 个节点，导入 ${result.scriptCount} 份正文。`)
+    } catch (err) {
+      setInitError(err instanceof Error ? err.message : "从线路导出恢复失败")
+    } finally {
+      setRestoringExport(false)
+    }
+  }, [project, galStore])
+
+  const handlePickExportForRestore = useCallback(async () => {
+    const selectedPath = await pickDirectory()
+    if (!selectedPath) return
+    await handleRestoreFromExport(selectedPath)
+  }, [handleRestoreFromExport])
+
   // 分支检查
   const handleLintBranch = useCallback(async () => {
     if (!project || !galStore.selectedRouteId) return
@@ -174,16 +235,28 @@ export function GalWorkspace() {
     setView("detail")
   }, [galStore])
 
+  const handleOpenLonglineWorkspace = useCallback((nodeId: string) => {
+    const route = galStore.project?.routes.find((item) => (item.nodes ?? []).some((node) => node.id === nodeId))
+    if (route) galStore.selectRoute(route.id)
+    galStore.selectNode(nodeId)
+    setLonglineStartNodeId(nodeId)
+    setView("longline")
+  }, [galStore])
+
   // 空状态：显示初始化按钮
   if (!isLoading && isEmptyProject(galStore.project)) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
+        <GalAiTaskToasts />
         <h2 className="text-xl font-semibold">Galgame 剧本工作台</h2>
         <p className="text-sm text-muted-foreground">
           此项目尚未初始化为 Galgame 项目。初始化会复用小说写作上下文生成线路骨架和入口节点。
         </p>
         {error && (
           <p className="text-sm text-destructive">{error}</p>
+        )}
+        {loadDebug && (
+          <p className="max-w-3xl text-center text-xs text-muted-foreground">{loadDebug}</p>
         )}
         <div className="flex flex-wrap items-center justify-center gap-2">
           <button
@@ -202,6 +275,22 @@ export function GalWorkspace() {
           >
             {loadingInitContext ? "读取中..." : "查看初始化上下文"}
           </button>
+          <button
+            type="button"
+            disabled={restoringExport}
+            onClick={() => void handleRestoreFromExport()}
+            className="rounded-md border px-6 py-2 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            {restoringExport ? "恢复中..." : "从当前导出恢复"}
+          </button>
+          <button
+            type="button"
+            disabled={restoringExport}
+            onClick={() => void handlePickExportForRestore()}
+            className="rounded-md border px-6 py-2 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            导入线路导出
+          </button>
         </div>
         {initContextPreview && (
           <InitContextPreview
@@ -216,8 +305,22 @@ export function GalWorkspace() {
   // 主工作台：路线树在 sidebar 中，这里显示画布或详情编辑器
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-background">
+      <GalAiTaskToasts />
       <div className="min-w-0 flex-1 overflow-hidden">
-        {view === "detail" && galStore.selectedNodeId ? (
+        {view === "longline" && longlineStartNodeId ? (
+          <GalLonglineWorkspace
+            route={galStore.currentNodeRoute() ?? galStore.selectedRoute()}
+            startNodeId={longlineStartNodeId}
+            onBackToBoard={() => {
+              setView("board")
+              galStore.selectNode(null)
+            }}
+            onBackToEditor={(nodeId) => {
+              galStore.selectNode(nodeId)
+              setView("detail")
+            }}
+          />
+        ) : view === "detail" && galStore.selectedNodeId ? (
           <GalNodeEditor
             onLintBranch={handleLintBranch}
             lintRunning={galStore.lintRunning}
@@ -226,6 +329,7 @@ export function GalWorkspace() {
             reinitializing={initializing}
             onShowInitContext={handleShowInitContext}
             loadingInitContext={loadingInitContext}
+            onOpenLonglineWorkspace={handleOpenLonglineWorkspace}
             onBackToBoard={() => {
               galStore.selectNode(null)
               setView("board")
@@ -239,6 +343,7 @@ export function GalWorkspace() {
             onReinitGal={handleReinitProject}
             reinitializing={initializing}
             error={error}
+            onOpenLonglineWorkspace={handleOpenLonglineWorkspace}
           />
         )}
       </div>

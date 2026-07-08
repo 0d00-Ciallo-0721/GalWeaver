@@ -13,6 +13,7 @@ const KNOWLEDGE_DIR: &str = "QM";
 const LEGACY_KNOWLEDGE_DIR: &str = "wiki";
 const META_DIR: &str = ".qmai";
 const LEGACY_META_DIR: &str = ".llm-wiki";
+const EXPORT_MARKER_FILE: &str = ".qmai-export.json";
 
 #[tauri::command]
 pub fn create_project(name: String, path: String) -> Result<WikiProject, String> {
@@ -314,6 +315,13 @@ pub fn validate_wiki_project_root(root: &Path) -> Result<(), String> {
     }
     if !root.is_dir() {
         return Err(format!("路径不是文件夹：'{}'", root.display()));
+    }
+
+    if root.join(EXPORT_MARKER_FILE).exists() {
+        return Err(format!(
+            "这是导出目录，不是项目根目录：'{}'",
+            root.display()
+        ));
     }
 
     let has_schema = root.join("schema.md").exists();

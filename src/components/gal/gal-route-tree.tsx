@@ -1,8 +1,11 @@
 import { useMemo, useState } from "react"
-import { ChevronDown, ChevronRight, Circle, GitBranch, Plus, Trash2 } from "lucide-react"
+import { AlertTriangle, ChevronDown, ChevronRight, Circle, FileDown, GitBranch, Loader2, Plus, Trash2 } from "lucide-react"
 import { useGalStore } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { loadGalProject, saveGalProject } from "@/lib/gal/gal-storage"
+import { exportGalProjectContents } from "@/lib/gal/gal-export"
+import { hasNodeOutgoingTarget } from "@/lib/gal/gal-graph-normalize"
+import { pickDirectory } from "@/lib/platform"
 import { getNodeTypeColor } from "./gal-utils"
 import type { GalNode, GalRoute } from "@/lib/gal/gal-types"
 
@@ -13,9 +16,13 @@ export function GalRouteTree() {
   const selectedNodeId = useGalStore((s) => s.selectedNodeId)
   const selectRoute = useGalStore((s) => s.selectRoute)
   const selectNode = useGalStore((s) => s.selectNode)
+  const requestLocateNode = useGalStore((s) => s.requestLocateNode)
   const setProject = useGalStore((s) => s.setProject)
   const setError = useGalStore((s) => s.setError)
   const [busy, setBusy] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportMessage, setExportMessage] = useState<string | null>(null)
+  const [exportMissingNodes, setExportMissingNodes] = useState<GalNode[]>([])
 
   const routes = Array.isArray(project?.routes) ? project.routes : []
   const mainRouteId = routes.find((route) => route.id === "main")?.id ?? routes[0]?.id
@@ -28,7 +35,7 @@ export function GalRouteTree() {
   if (!project || routes.length === 0) {
     return (
       <div className="flex h-full flex-col overflow-hidden">
-        <Header busy={busy} onAddRoute={() => {}} />
+        <Header busy={busy} exporting={exporting} onAddRoute={() => {}} onExport={() => {}} />
         <div className="flex flex-1 items-center justify-center p-4 text-center text-xs text-muted-foreground">
           暂无线路，请先初始化 Gal 项目
         </div>
@@ -172,9 +179,74 @@ export function GalRouteTree() {
     }
   }
 
+  const handleExportAll = async () => {
+    if (!project || !wikiProject?.path || exporting) return
+    setExporting(true)
+    setExportMessage(null)
+    setExportMissingNodes([])
+    setError(null)
+    try {
+      const destination = await pickDirectory()
+      if (!destination) return
+      const result = await exportGalProjectContents(
+        wikiProject.path,
+        destination,
+        project,
+      )
+      setExportMissingNodes(result.missingNodes)
+      setExportMessage(
+        `已导出 ${result.nodeCount} 个节点、${result.routeCount} 条单线`
+        + (result.missingNodes.length > 0
+          ? `，${result.missingNodes.length} 个节点缺少正文`
+          : ""),
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出线路失败")
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      <Header busy={busy} onAddRoute={handleAddPathRoute} />
+      <Header
+        busy={busy}
+        exporting={exporting}
+        onAddRoute={handleAddPathRoute}
+        onExport={() => void handleExportAll()}
+      />
+      {exportMessage && (
+        <div className="border-b bg-muted/50 px-3 py-2 text-[11px] text-muted-foreground">
+          {exportMessage}
+        </div>
+      )}
+      {exportMissingNodes.length > 0 && (
+        <div className="border-b border-amber-500/20 bg-amber-500/5 px-3 py-2">
+          <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-amber-300">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            缺少正文的节点
+          </div>
+          <div className="max-h-28 space-y-1 overflow-y-auto pr-1">
+            {exportMissingNodes.map((node) => (
+              <button
+                key={node.id}
+                type="button"
+                onClick={() => {
+                  selectRoute(mainRouteId ?? node.routeId)
+                  selectNode(node.id)
+                  requestLocateNode(node.id)
+                }}
+                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] text-amber-100 hover:bg-amber-500/10"
+                title={`点击定位节点：${node.id}`}
+              >
+                <Circle className="h-2 w-2 shrink-0 text-amber-300" />
+                <span className="min-w-0 flex-1 truncate">{node.title || node.id}</span>
+                <span className="shrink-0 text-[10px] text-amber-200/70">{node.id}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto p-1">
         {routes.map((route) => {
           const isMainRoute = route.id === mainRouteId
@@ -202,6 +274,12 @@ export function GalRouteTree() {
                 selectRoute(route.id)
                 selectNode(nodeId)
               }}
+              onLocateNode={(nodeId) => {
+                if (!isMainRoute) return
+                selectRoute(route.id)
+                selectNode(null)
+                requestLocateNode(nodeId)
+              }}
               onAddLooseNode={handleAddLooseNode}
               onRename={(title) => updatePathRoute(route.id, { title })}
               onAppendNode={(nodeId) => {
@@ -228,10 +306,14 @@ export function GalRouteTree() {
 
 function Header({
   busy,
+  exporting,
   onAddRoute,
+  onExport,
 }: {
   busy: boolean
+  exporting: boolean
   onAddRoute: () => void
+  onExport: () => void
 }) {
   return (
     <div className="flex items-center gap-2 border-b px-3 py-2">
@@ -239,7 +321,18 @@ function Header({
       <span className="min-w-0 flex-1 text-sm font-medium">线路 & 节点</span>
       <button
         type="button"
-        disabled={busy}
+        disabled={busy || exporting}
+        onClick={onExport}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-md border hover:bg-accent disabled:opacity-40"
+        title="导出全部线路与完整正文"
+      >
+        {exporting
+          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          : <FileDown className="h-3.5 w-3.5" />}
+      </button>
+      <button
+        type="button"
+        disabled={busy || exporting}
         onClick={onAddRoute}
         className="inline-flex h-7 w-7 items-center justify-center rounded-md border hover:bg-accent disabled:opacity-40"
         title="新增线路路径"
@@ -259,6 +352,7 @@ function RouteSection({
   busy,
   onSelectRoute,
   onSelectNode,
+  onLocateNode,
   onAddLooseNode,
   onRename,
   onAppendNode,
@@ -273,6 +367,7 @@ function RouteSection({
   busy: boolean
   onSelectRoute: () => void
   onSelectNode: (nodeId: string) => void
+  onLocateNode: (nodeId: string) => void
   onAddLooseNode: () => void
   onRename: (title: string) => void
   onAppendNode: (nodeId: string) => void
@@ -284,6 +379,11 @@ function RouteSection({
   const [renameValue, setRenameValue] = useState(route.title)
   const nodes = isMainRoute ? sortNodes(route.nodes ?? []) : (route.nodes ?? [])
   const candidateNodes = isMainRoute ? [] : getNextPathCandidates(route, mainNodeById)
+  const nodeById = useMemo(
+    () => new Map((route.nodes ?? []).map((node) => [node.id, node])),
+    [route.nodes],
+  )
+  const outgoingNodeById = isMainRoute ? nodeById : mainNodeById
 
   return (
     <div>
@@ -390,7 +490,12 @@ function RouteSection({
             </div>
           )}
 
-          {nodes.map((node, index) => (
+          {nodes.map((node, index) => {
+            const unfinishedTerminal = isUnfinishedTerminalNode(node, outgoingNodeById, route)
+            const nodeTitleColor = unfinishedTerminal
+              ? "font-semibold text-orange-300"
+              : getNodeTypeColor(node.type)
+            return (
             <div
               key={`${node.id}-${index}`}
               className={`flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-xs transition-colors ${
@@ -402,13 +507,22 @@ function RouteSection({
               <button
                 type="button"
                 onClick={() => onSelectNode(node.id)}
+                onContextMenu={(event) => {
+                  if (!isMainRoute) return
+                  event.preventDefault()
+                  onLocateNode(node.id)
+                }}
                 className={`flex min-w-0 flex-1 items-center gap-1.5 text-left ${isMainRoute ? "" : "cursor-default"}`}
+                title={isMainRoute ? "左键编辑，右键在画布中定位" : undefined}
               >
-                <Circle className="h-2 w-2 shrink-0 text-muted-foreground/50" />
-                <span className={`truncate ${getNodeTypeColor(node.type)}`}>{node.title}</span>
+                <Circle className={`h-2 w-2 shrink-0 ${unfinishedTerminal ? "text-orange-300" : "text-muted-foreground/50"}`} />
+                <span className={`truncate ${nodeTitleColor}`}>{node.title}</span>
               </button>
               {!isMainRoute && index < nodes.length - 1 && (
                 <span className="text-[10px] text-muted-foreground">→</span>
+              )}
+              {unfinishedTerminal && (
+                <span className="shrink-0 text-[10px] font-semibold text-orange-300">!</span>
               )}
               {isMainRoute && node.status !== "card" && (
                 <span className="shrink-0 text-[10px] text-muted-foreground">
@@ -416,7 +530,8 @@ function RouteSection({
                 </span>
               )}
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>
@@ -447,4 +562,13 @@ function sortNodes(nodes: GalNode[]): GalNode[] {
     if (b.type === "entry" && a.type !== "entry") return 1
     return (a.sequence || 0) - (b.sequence || 0)
   })
+}
+
+function isUnfinishedTerminalNode(
+  node: GalNode,
+  nodeById: Map<string, GalNode>,
+  route: GalRoute,
+): boolean {
+  const isEnding = node.type === "ending" || (route.endingNodeIds ?? []).includes(node.id)
+  return !isEnding && !hasNodeOutgoingTarget(node, nodeById)
 }

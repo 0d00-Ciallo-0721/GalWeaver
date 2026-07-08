@@ -69,6 +69,7 @@ export function buildEntryNodePrompt(params: {
   nodeGoal: string
   scene: string
   characters: string
+  childBeginnings: string
   soulDoc: string
   outline: string
   language: string
@@ -87,24 +88,35 @@ ${params.outline || "（无）"}
 - 场景：${params.scene}
 - 出场人物：${params.characters}
 
+## 后继节点前文
+${params.childBeginnings}
+
 ## 写作要求
 1. 使用视觉小说剧本格式：场景描写、心理、对话。
 2. 人物对话前标注角色名。
 3. 严格遵守项目上下文，不要新增上下文不存在的人物关系。
-4. 结尾停在自然选择点。
+4. 已存在后继节点时，正文结尾必须直接衔接“后继节点前文”，不得写成与后继节点冲突或无关的收尾。
 5. 如果当前节点已有手动选项，正文结尾要自然导向这些选项。
+6. 如果有多个后继节点，正文应停在能共同通向这些后继节点的自然分岔点；没有后继节点时才自由收尾。
 
 请用${params.language}撰写。`
 }
 
 export function buildChildNodeCardPrompt(params: {
   parentNodeTitle: string
+  parentNodeGoal: string
+  parentNodeScene: string
+  parentNodeSummary: string
+  parentCharacters: string
   parentEndingText: string
   choiceText: string
   choiceIntent: string
+  choiceNextNodeTitle: string
+  choiceNextNodeGoal: string
   routeTheme: string
   premise: string
   globalRules: string
+  contextText: string
   variableState: string
   language: string
 }): string {
@@ -121,14 +133,30 @@ ${params.routeTheme}
 
 ## 父节点
 标题：${params.parentNodeTitle}
+剧情目标：${params.parentNodeGoal || "（无）"}
+当前场景：${params.parentNodeScene || "（无）"}
+节点摘要：${params.parentNodeSummary || "（无）"}
+出场人物：${params.parentCharacters || "（无）"}
 结尾内容：${params.parentEndingText}
 
 ## 玩家选项
 选项：${params.choiceText}
 情感意图：${params.choiceIntent}
+人工建议标题：${params.choiceNextNodeTitle || "（无）"}
+人工建议目标：${params.choiceNextNodeGoal || "（无）"}
 
 ## 当前变量状态
 ${params.variableState}
+
+## 完整上下文参考
+${params.contextText}
+
+## 生成要求
+1. 后续节点必须承接父节点结尾和玩家选项，不得跳到上下文中不存在的地点、人物或事件。
+2. scene 字段必须优先沿用或自然延伸“父节点当前场景”；只有选项文本或父节点结尾明确发生转场时，才可以填写新场景，并在 goal/summary 中体现转场原因。
+3. characters 字段只填写该后续节点实际出场人物，优先从父节点人物、角色档案和大纲中选择，不要创造新角色。
+4. title、goal、summary 应优先尊重人工建议标题和人工建议目标；如果它们与父节点结尾冲突，则以父节点结尾和完整上下文为准。
+5. 只规划节点卡片，不编写完整正文。
 
 ## 输出格式
 \`\`\`json
@@ -157,6 +185,154 @@ ${params.variableState}
 请用${params.language}撰写，只输出 JSON。`
 }
 
+export function buildChoiceLongLinePrompt(params: {
+  parentNodeTitle: string
+  parentNodeGoal: string
+  parentNodeScene: string
+  parentNodeSummary: string
+  parentCharacters: string
+  parentEndingText: string
+  choiceText: string
+  choiceIntent: string
+  choiceNextNodeTitle: string
+  choiceNextNodeGoal: string
+  routeTheme: string
+  premise: string
+  globalRules: string
+  contextText: string
+  variableState: string
+  nodeCount: number
+  userPrompt: string
+  language: string
+}): string {
+  return `你是 Galgame 长线剧情结构规划师。请基于父节点结尾和玩家选项，生成一条连续剧情线的节点卡片数组。
+
+## 全局设定
+${params.premise}
+
+## 全局规则
+${params.globalRules}
+
+## 当前主线主题
+${params.routeTheme}
+
+## 父节点
+标题：${params.parentNodeTitle}
+剧情目标：${params.parentNodeGoal || "（无）"}
+当前场景：${params.parentNodeScene || "（无）"}
+节点摘要：${params.parentNodeSummary || "（无）"}
+出场人物：${params.parentCharacters || "（无）"}
+结尾内容：${params.parentEndingText}
+
+## 玩家选项
+选项：${params.choiceText}
+情感意图：${params.choiceIntent || "（无）"}
+人工建议标题：${params.choiceNextNodeTitle || "（无）"}
+人工建议目标：${params.choiceNextNodeGoal || "（无）"}
+
+## 当前变量状态
+${params.variableState}
+
+## 完整上下文参考
+${params.contextText}
+
+## 用户对这条长线的补充要求
+${params.userPrompt || "（无）"}
+
+## 生成要求
+1. 必须生成 exactly ${params.nodeCount} 个连续节点卡片，形成一条单线剧情：第 1 个节点承接玩家选项，后续节点逐个承接前一个节点。
+2. 这是长线剧情，不要每个节点都再次分大叉；除最后一个节点外，每个节点最多给 1 个自然推进选项。
+3. 第 1 个节点优先尊重人工建议标题和目标；后续节点要形成明确的事件推进、情绪变化或信息揭露。
+4. scene 字段必须沿用或自然延伸父节点场景；只有剧情明确转场时才改场景，并在 goal/summary 中说明原因。
+5. characters 字段只填写实际出场人物，优先从父节点人物、角色档案和大纲中选择，不要创造新角色。
+6. effects 只能使用已存在变量；不要创建新变量。
+7. 只规划节点卡片，不编写完整正文。
+
+## 输出格式
+\`\`\`json
+{
+  "nodes": [
+    {
+      "title": "节点标题",
+      "type": "daily",
+      "goal": "剧情目标",
+      "summary": "节点概要",
+      "scene": "场景描述",
+      "characters": ["角色名"],
+      "effects": [{ "variable": "变量ID", "op": "add", "value": 1 }],
+      "choices": [
+        {
+          "id": "choice_id",
+          "text": "通向下一个节点的选项文本",
+          "emotionalIntent": "情感意图",
+          "effects": [],
+          "nextNodeTitle": "下一个节点建议标题",
+          "nextNodeGoal": "下一个节点剧情目标"
+        }
+      ]
+    }
+  ]
+}
+\`\`\`
+
+请用${params.language}撰写，只输出 JSON。`
+}
+
+export function buildRelayNodeCardPrompt(params: {
+  parentTitle: string
+  parentEnding: string
+  childTitle: string
+  childBeginning: string
+  edgeLabel: string
+  routeTheme: string
+  premise: string
+  globalRules: string
+  language: string
+}): string {
+  return `你是 Galgame 剧情结构规划师。请在父节点与子节点之间设计一个自然的中继过渡节点。
+
+## 项目设定
+${params.premise || "（无）"}
+
+## 全局规则
+${params.globalRules || "（无）"}
+
+## 线路主题
+${params.routeTheme || "（无）"}
+
+## 父节点
+标题：${params.parentTitle}
+正文结尾或卡片信息：
+${params.parentEnding}
+
+## 子节点
+标题：${params.childTitle}
+正文开头或卡片信息：
+${params.childBeginning}
+
+## 原连接含义
+${params.edgeLabel || "（默认出口）"}
+
+## 生成要求
+1. 中继节点必须自然承接父节点，并明确铺垫到子节点，不能改变两端既定事实。
+2. 只规划节点卡片，不编写完整正文。
+3. entryChoiceText 是中继节点进入原子节点的固定入口选项，必须与子节点开头直接衔接。
+4. 不生成变量影响；后续可由作者在中继节点详情页添加其他选项。
+5. 只输出下列 JSON，不要添加解释或 Markdown。
+
+{
+  "title": "中继节点标题",
+  "goal": "中继节点剧情目标",
+  "summary": "中继节点内容摘要",
+  "scene": "中继节点场景",
+  "characters": ["角色名"],
+  "entryChoiceText": "进入原子节点的固定入口选项",
+  "entryChoiceIntent": "该入口选项的情感意图"
+}
+
+请用${params.language}撰写。`
+}
+
 export function buildNodeGenerationPrompt(params: {
   nodeTitle: string
   nodeGoal: string
@@ -164,6 +340,7 @@ export function buildNodeGenerationPrompt(params: {
   scene: string
   characters: string
   parentEndings: string
+  childBeginnings: string
   soulDoc: string
   outline: string
   variableState: string
@@ -193,6 +370,9 @@ ${params.routeContext}
 ## 父节点结尾
 ${params.parentEndings}
 
+## 后继节点前文
+${params.childBeginnings}
+
 ## 变量状态
 ${params.variableState}
 
@@ -206,7 +386,8 @@ ${params.clueContext}
 1. 用视觉小说剧本格式写正文。
 2. 严格承接父节点结尾和当前节点目标。
 3. 遵守项目大纲、角色认知和变量状态。
-4. 结尾停在自然选择点。
+4. 已存在后继节点时，正文结尾必须直接衔接“后继节点前文”，不得写成与后继节点冲突或无关的收尾。
+5. 如果有多个后继节点，正文应停在能共同通向这些后继节点的自然分岔点；没有后继节点时才自由收尾。
 
 请用${params.language}撰写。`
 }

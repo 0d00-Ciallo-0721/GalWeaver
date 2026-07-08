@@ -37,6 +37,7 @@ import type {
 } from "./gal-types"
 import { useWikiStore, type LlmConfig } from "@/stores/wiki-store"
 import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
+import { sanitizeGalChoices } from "./gal-variable-guard"
 
 // ─── 摄取参数 ──────────────────────────────────────────────
 
@@ -185,9 +186,7 @@ ${cluesDesc || "（无项目线索）"}
   "relationshipChanges": ["角色关系变化描述，格式：A→B：关系变化"],
   "cognitionChanges": ["角色认知变化描述，格式：角色名：知道/不知道XXX"],
   "clueChanges": ["线索推进描述，格式：发现/推进/回收：线索名"],
-  "variableChanges": [
-    { "variable": "变量ID", "op": "set" | "add", "value": 数值或字符串 }
-  ],
+  "variableChanges": [],
   "endingHook": "节点结尾钩子描述（50字以内）",
   "choices": [
     {
@@ -201,7 +200,10 @@ ${cluesDesc || "（无项目线索）"}
   ],
   "graphNodes": ["图谱节点ID列表，如 character:角色名、location:地点名"],
   "graphEdges": ["图谱关系边列表，格式：A->关系->B。关系：出场于|发生于|持有|敌对|合作|怀疑|隐瞒|知道|不知道"]
-}`
+}
+
+注意：
+- variableChanges 必须返回空数组。变量数值只由 Gal 编辑器里人工配置的选项 effects 负责，不要从正文推测变量变化。`
 
   const messages = [
     { role: "system" as const, content: systemPrompt },
@@ -244,20 +246,16 @@ ${cluesDesc || "（无项目线索）"}
     relationshipChanges: Array.isArray(parsed.relationshipChanges) ? parsed.relationshipChanges : [],
     cognitionChanges: Array.isArray(parsed.cognitionChanges) ? parsed.cognitionChanges : [],
     clueChanges: Array.isArray(parsed.clueChanges) ? parsed.clueChanges : [],
-    variableChanges: Array.isArray(parsed.variableChanges) ? parsed.variableChanges.map((e: { variable: string; op: string; value: unknown }) => ({
-      variable: e.variable,
-      op: (e.op === "set" ? "set" : "add") as "set" | "add",
-      value: e.value,
-    })) : [],
+    variableChanges: [],
     endingHook: parsed.endingHook || "",
-    choices: Array.isArray(parsed.choices) ? parsed.choices.map((c: Record<string, unknown>, i: number) => ({
+    choices: sanitizeGalChoices(Array.isArray(parsed.choices) ? parsed.choices.map((c: Record<string, unknown>, i: number) => ({
       id: (c.id as string) || `c_${i}`,
       text: (c.text as string) || "",
       emotionalIntent: (c.emotionalIntent as string) || "",
       effects: Array.isArray(c.effects) ? c.effects as GalEffect[] : [],
       nextNodeTitle: (c.nextNodeTitle as string) || "",
       nextNodeGoal: (c.nextNodeGoal as string) || "",
-    })) : [],
+    })) : [], project?.variables ?? []),
     graphNodes: Array.isArray(parsed.graphNodes) ? parsed.graphNodes : [],
     graphEdges: Array.isArray(parsed.graphEdges) ? parsed.graphEdges : [],
     sourceRevision: 1,
@@ -318,19 +316,41 @@ async function propagateStateToChildren(
   for (const childId of node.children) {
     const child = route.nodes.find((n) => n.id === childId)
     if (!child) continue
+    const choiceEffects = (node.choices ?? []).find((choice) => choice.nextNodeId === childId)?.effects ?? []
+    const nextIncomingState = applyEffectsToState(node.outgoingState, choiceEffects)
 
     // 合并：对于共同节点，保留已有状态，叠加新状态
     if (child.parents.length > 1) {
       // 共同节点：合并所有父节点的状态（取并集）
       child.incomingState = mergeStates(
         child.incomingState,
-        node.outgoingState,
+        nextIncomingState,
       )
     } else {
       // 单一父节点：直接继承
-      child.incomingState = { ...node.outgoingState }
+      child.incomingState = { ...nextIncomingState }
     }
   }
+}
+
+function applyEffectsToState(
+  state: NonNullable<GalNode["outgoingState"]>,
+  effects: GalEffect[],
+): NonNullable<GalNode["outgoingState"]> {
+  if (effects.length === 0) return { ...state }
+  const variables = { ...state.variables }
+  for (const effect of effects) {
+    if (effect.op === "set") {
+      variables[effect.variable] = effect.value
+    } else {
+      const current = Number(variables[effect.variable] ?? 0)
+      const delta = Number(effect.value)
+      variables[effect.variable] = Number.isFinite(current) && Number.isFinite(delta)
+        ? current + delta
+        : effect.value
+    }
+  }
+  return { ...state, variables }
 }
 
 function mergeStates(

@@ -105,6 +105,42 @@ export { lintBranchGraph } from "./gal-branch-lint"
 
 // 任务路由
 export {
+  detectGalLonglineRange,
+} from "./gal-longline-range"
+export type {
+  GalLonglineDirection,
+  GalLonglineRange,
+  GalLonglineRangeWarning,
+  GalLonglineStop,
+  GalLonglineStopReason,
+} from "./gal-longline-range"
+
+export {
+  reviewGalLongline,
+} from "./gal-longline-review"
+export type {
+  GalLonglineContinuityBreak,
+  GalLonglineIssue,
+  GalLonglineReviewNodeInput,
+  GalLonglineReviewParams,
+  GalLonglineReviewReport,
+  GalLonglineRewriteTarget,
+  GalLonglineSuggestedInsertion,
+} from "./gal-longline-review"
+
+export {
+  generateGalLonglineOptimizationPlan,
+} from "./gal-longline-optimization"
+export type {
+  GalLonglineNodeOptimization,
+  GalLonglineOptimizationParams,
+  GalLonglineOptimizationPlan,
+  GalLonglineOptimizeMode,
+  GalLonglineOptimizeSuggestion,
+  GalLonglineSuggestedNodeInsertion,
+} from "./gal-longline-optimization"
+
+export {
   routeGalTask,
   buildGalTaskDirective,
 } from "./gal-task-router"

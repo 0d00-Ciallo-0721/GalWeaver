@@ -35,6 +35,10 @@ import type {
   GalNodeMemory,
   NodeSnapshot,
 } from "./gal-types"
+import { normalizeGalProjectRelations, normalizeGalRouteRelations } from "./gal-graph-normalize"
+import { sanitizeGalProjectVariables } from "./gal-variable-guard"
+
+type GalRouteMeta = Partial<GalRoute> & { id: string }
 
 // 鈹€鈹€鈹€ 璺緞宸ュ叿 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -54,10 +58,24 @@ async function ensureDir(dirPath: string): Promise<void> {
 
 async function readJson<T>(filePath: string): Promise<T | null> {
   try {
-    const raw = coerceText(await readFile(filePath))
+    const raw = stripJsonBom(coerceText(await readFile(filePath)))
     return JSON.parse(raw) as T
   } catch {
     return null
+  }
+}
+
+async function readRequiredJson<T>(filePath: string): Promise<T> {
+  let raw: string
+  try {
+    raw = stripJsonBom(coerceText(await readFile(filePath)))
+  } catch (err) {
+    throw new Error(`读取 Gal 项目文件失败：${filePath}；${err instanceof Error ? err.message : String(err)}`)
+  }
+  try {
+    return JSON.parse(raw) as T
+  } catch (err) {
+    throw new Error(`解析 Gal 项目文件失败：${filePath}；${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -89,9 +107,12 @@ export async function saveGalProject(
   project: GalProject,
 ): Promise<void> {
   await initGalDirectory(projectPath)
+  const normalizedProject = normalizeGalProjectRelations(
+    sanitizeGalProjectVariables(project),
+  )
 
   // 鍒嗙锛歱roject.json 涓嶅瓨瀹屾暣鑺傜偣鏁版嵁锛屽彧瀛樿矾鐢卞厓鏁版嵁
-  const projectRoutes = Array.isArray(project.routes) ? project.routes : []
+  const projectRoutes = Array.isArray(normalizedProject.routes) ? normalizedProject.routes : []
   const routesMeta = projectRoutes.map((r) => ({
     id: r.id,
     title: r.title,
@@ -103,19 +124,19 @@ export async function saveGalProject(
   }))
 
   await writeJson(galPath(projectPath, "project.json"), {
-    ...project,
+    ...normalizedProject,
     routes: routesMeta,
     // ponytail: nodes 鍜?clues 鍗曠嫭瀛橈紝閬垮厤 project.json 鑶ㄨ儉
   } as GalProject & { routes: typeof routesMeta })
 
   // 鍙橀噺
-  await writeJson(galPath(projectPath, "variables.json"), project.variables)
+  await writeJson(galPath(projectPath, "variables.json"), normalizedProject.variables)
 
   // 绾跨储
-  await writeJson(galPath(projectPath, "clues.json"), project.clues)
+  await writeJson(galPath(projectPath, "clues.json"), normalizedProject.clues)
 
   // CG
-  await writeJson(galPath(projectPath, "cgs.json"), project.cgs)
+  await writeJson(galPath(projectPath, "cgs.json"), normalizedProject.cgs)
 
   // 路线元数据
   await writeJson(galPath(projectPath, "routes.json"), routesMeta)
@@ -127,8 +148,9 @@ export async function saveGalProject(
 }
 
 export async function loadGalProject(projectPath: string): Promise<GalProject | null> {
-  const project = await readJson<GalProject>(galPath(projectPath, "project.json"))
-  if (!project) return null
+  const projectPathJson = galPath(projectPath, "project.json")
+  if (!(await fileExists(projectPathJson))) return null
+  const project = await readRequiredJson<GalProject>(projectPathJson)
 
   const variables = await readJson<GalVariable[]>(
     galPath(projectPath, "variables.json"),
@@ -138,36 +160,68 @@ export async function loadGalProject(projectPath: string): Promise<GalProject | 
 
   // 鍔犺浇瀹屾暣绾胯矾鏁版嵁
   const routes: GalRoute[] = []
-  const routesMeta = await readJson<
-    { id: string }[]
-  >(galPath(projectPath, "routes.json"))
+  const routesMeta = await loadRouteMetas(projectPath, project)
 
-  if (routesMeta) {
-    for (const meta of routesMeta) {
-      const route = await loadGalRoute(projectPath, meta.id)
-      if (route) {
-        routes.push(route)
-      } else {
-        routes.push({
-          id: meta.id,
-          title: "未命名线路",
-          theme: "",
-          nodeIds: [],
-          entryNodeId: "",
-          endingNodeIds: [],
-          nodes: [],
-        })
-      }
+  for (const meta of routesMeta) {
+    const route = await loadGalRoute(projectPath, meta.id)
+    if (route) {
+      routes.push(route)
+    } else {
+      routes.push({
+        id: meta.id,
+        title: typeof meta.title === "string" ? meta.title : "未命名线路",
+        theme: typeof meta.theme === "string" ? meta.theme : "",
+        nodeIds: Array.isArray(meta.nodeIds) ? meta.nodeIds : [],
+        entryNodeId: typeof meta.entryNodeId === "string" ? meta.entryNodeId : "",
+        endingNodeIds: Array.isArray(meta.endingNodeIds) ? meta.endingNodeIds : [],
+        nodes: [],
+      })
     }
   }
 
-  return {
+  return normalizeGalProjectRelations({
     ...project,
     variables: variables ?? [],
     clues: clues ?? [],
     cgs: cgs ?? [],
     routes: normalizeLoadedRoutes(routes),
+  })
+}
+
+async function loadRouteMetas(
+  projectPath: string,
+  project: GalProject,
+): Promise<GalRouteMeta[]> {
+  const merged = new Map<string, GalRouteMeta>()
+  const add = (meta: Partial<GalRoute>) => {
+    if (typeof meta.id === "string" && meta.id.trim()) {
+      merged.set(meta.id, { ...(merged.get(meta.id) ?? {}), ...meta, id: meta.id })
+    }
   }
+  const routesMeta = await readJson<Partial<GalRoute>[]>(
+    galPath(projectPath, "routes.json"),
+  )
+
+  if (Array.isArray(routesMeta)) {
+    for (const meta of routesMeta) add(meta)
+  }
+  if (Array.isArray(project.routes)) {
+    for (const meta of project.routes) add(meta)
+  }
+
+  if (merged.size === 0) {
+    try {
+      const entries = await listDirectory(galPath(projectPath, "routes"))
+      for (const entry of entries) {
+        if (entry.is_dir || !entry.name.endsWith(".json") || entry.name.includes(".bak")) continue
+        add({ id: entry.name.replace(/\.json$/, "") })
+      }
+    } catch {
+      // routes.json/project.json 是主索引；目录扫描只做兜底。
+    }
+  }
+
+  return Array.from(merged.values())
 }
 
 // 鈹€鈹€鈹€ 绾胯矾璇诲啓 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -176,13 +230,13 @@ export async function saveGalRoute(
   projectPath: string,
   route: GalRoute,
 ): Promise<void> {
+  const normalizedRoute = normalizeGalRouteRelations(route)
   // 绾胯矾 JSON锛坣ode 鍏冩暟鎹笉鍚鏂囷級
   const routeData: Omit<GalRoute, "nodes"> & {
     nodes: Omit<GalNode, "scriptPath">[]
   } = {
-    ...route,
-    endingNodeIds: Array.isArray(route.endingNodeIds) ? route.endingNodeIds : [],
-    nodes: (Array.isArray(route.nodes) ? route.nodes : []).map((n) => {
+    ...normalizedRoute,
+    nodes: (Array.isArray(normalizedRoute.nodes) ? normalizedRoute.nodes : []).map((n) => {
       const { scriptPath: _sp, ...rest } = n
       return {
         ...normalizeNodeArrays(rest as GalNode),
@@ -216,11 +270,11 @@ export async function loadGalRoute(
     scriptPath: `nodes/${routeId}/${n.id}.md`,
   }))
 
-  return {
+  return normalizeGalRouteRelations({
     ...data,
     endingNodeIds: Array.isArray(data.endingNodeIds) ? data.endingNodeIds : [],
     nodes,
-  }
+  } as GalRoute)
 }
 
 // 鈹€鈹€鈹€ 鑺傜偣姝ｆ枃璇诲啓 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -452,4 +506,8 @@ function coerceText(value: unknown): string {
     }
   }
   return String(value)
+}
+
+function stripJsonBom(value: string): string {
+  return value.charCodeAt(0) === 0xFEFF ? value.slice(1) : value
 }

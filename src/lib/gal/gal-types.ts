@@ -81,6 +81,11 @@ export interface GalNode {
   goal: string
   /** 节点概要（card 状态下由 AI 生成） */
   summary: string
+  /** 线路画布中的手动布局位置 */
+  boardPosition?: {
+    x: number
+    y: number
+  }
   /** 节点正文存储路径（相对于项目根目录） */
   scriptPath: string
   /** 进入节点前的状态快照 */
@@ -97,6 +102,8 @@ export interface GalNode {
   scene: string
   /** 本节点 AI 正文生成的补充提示词 */
   aiPrompt?: string
+  /** 本节点 AI 选项生成的补充提示词 */
+  choicePrompt?: string
   /** 关联的 CG ID */
   cgId?: string
   /** 本章获得的线索 ID */

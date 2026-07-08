@@ -14,6 +14,15 @@ import type {
   GalVariable,
   BranchLintResult,
 } from "./gal-types"
+import { getNodeOutgoingTargets, hasNodeOutgoingTarget, normalizeGalRouteRelations } from "./gal-graph-normalize"
+
+const legacyBranchCheckers = [
+  checkBrokenChildren,
+  checkChoiceTargets,
+  checkEndingReachability,
+  checkDeadEnds,
+]
+void legacyBranchCheckers
 
 // ─── 主入口 ────────────────────────────────────────────────
 
@@ -24,17 +33,18 @@ export async function lintBranchGraph(
   const project = await loadGalProject(projectPath)
   if (!project) return []
 
-  const route = project.routes.find((r) => r.id === routeId)
-  if (!route) return []
+  const rawRoute = project.routes.find((r) => r.id === routeId)
+  if (!rawRoute) return []
+  const route = normalizeGalRouteRelations(rawRoute)
 
   const results: BranchLintResult[] = []
 
   // 规则引擎检查（免费，按严重度排序）
   checkOrphanEntry(route, results)
-  checkBrokenChildren(route, results)
-  checkChoiceTargets(route, results)
-  checkEndingReachability(route, results)
-  checkDeadEnds(route, project.variables, results)
+  checkCanonicalBrokenChildren(route, results)
+  checkCanonicalChoiceTargets(route, results)
+  checkCanonicalEndingReachability(route, results)
+  checkCanonicalDeadEnds(route, results)
   checkVariableBounds(route, project.variables, results)
   checkConditionImpossible(route, project.variables, results)
   checkMergeConflicts(route, results)
@@ -374,6 +384,165 @@ function bfsReachable(
       if (choice.nextNodeId && !visited.has(choice.nextNodeId)) {
         queue.push(choice.nextNodeId)
       }
+    }
+  }
+
+  return visited
+}
+
+function checkCanonicalBrokenChildren(route: GalRoute, results: BranchLintResult[]): void {
+  const nodeMap = new Map(route.nodes.map((node) => [node.id, node]))
+
+  for (const node of route.nodes) {
+    for (const choice of node.choices ?? []) {
+      if (!choice.nextNodeId) continue
+      if (nodeMap.has(choice.nextNodeId)) continue
+      results.push({
+        severity: "high",
+        type: "broken_child",
+        nodeId: node.id,
+        routeId: route.id,
+        message: `节点「${node.title}」的选项「${choice.text || choice.id}」连接了不存在的节点`,
+        detail: `选项 nextNodeId=${choice.nextNodeId} 在当前路线节点列表中不存在。`,
+        suggestion: "重新连接该选项，或删除无效的目标节点 ID。",
+      })
+    }
+
+    for (const childId of node.children ?? []) {
+      if (nodeMap.has(childId)) continue
+      results.push({
+        severity: "high",
+        type: "broken_child",
+        nodeId: node.id,
+        routeId: route.id,
+        message: `节点「${node.title}」的默认出口连接了不存在的节点`,
+        detail: `children 包含不存在的节点 ID：${childId}。`,
+        suggestion: "解除该默认出口，或重新连接到真实节点。",
+      })
+    }
+
+    for (const target of getNodeOutgoingTargets(node, nodeMap)) {
+      const child = nodeMap.get(target.targetId)
+      if (!child || (child.parents ?? []).includes(node.id)) continue
+      results.push({
+        severity: "low",
+        type: "broken_child",
+        nodeId: node.id,
+        routeId: route.id,
+        message: `节点「${node.title}」连接到「${child.title}」，但目标节点 parents 未记录该父节点`,
+        detail: "出口关系和反向 parents 缓存不一致。保存项目时会自动规范化。",
+        suggestion: "保存当前 Gal 项目以刷新关系缓存。",
+      })
+    }
+  }
+}
+
+function checkCanonicalChoiceTargets(route: GalRoute, results: BranchLintResult[]): void {
+  for (const node of route.nodes) {
+    if (node.type === "choice" && (node.choices ?? []).length === 0) {
+      results.push({
+        severity: "high",
+        type: "choice_target_missing",
+        nodeId: node.id,
+        routeId: route.id,
+        message: `选择节点「${node.title}」没有定义任何选项`,
+        detail: "choice 类型节点至少需要一个选项，或改成普通/结局节点。",
+        suggestion: "为该节点添加选项，或调整节点类型。",
+      })
+    }
+
+    for (const choice of node.choices ?? []) {
+      if (choice.nextNodeId) continue
+      results.push({
+        severity: "low",
+        type: "choice_target_missing",
+        nodeId: node.id,
+        routeId: route.id,
+        message: `节点「${node.title}」的选项「${choice.text || choice.id}」尚未连接目标节点`,
+        detail: "该选项存在于详情页，但没有 nextNodeId；它不会在画布上生成选项连线。",
+        suggestion: "如果它需要成为分支，请使用 AI 展开、手动展开或收束到已有节点；如果只是文案占位，可以暂时忽略。",
+      })
+    }
+  }
+}
+
+function checkCanonicalEndingReachability(route: GalRoute, results: BranchLintResult[]): void {
+  const nodeMap = new Map(route.nodes.map((node) => [node.id, node]))
+  const endingIds = Array.from(new Set([
+    ...(route.endingNodeIds ?? []),
+    ...route.nodes.filter((node) => node.type === "ending").map((node) => node.id),
+  ])).filter((id) => nodeMap.has(id))
+
+  if (endingIds.length === 0) {
+    results.push({
+      severity: "medium",
+      type: "ending_unreachable",
+      routeId: route.id,
+      message: `线路「${route.title}」没有定义结局节点`,
+      detail: "当前路线没有 type=ending 的节点，也没有有效 endingNodeIds。",
+      suggestion: "将一个终点节点标记为 ending，或把它加入 endingNodeIds。",
+    })
+    return
+  }
+
+  const entryId = route.entryNodeId
+  if (!entryId || !nodeMap.has(entryId)) return
+  const reachable = bfsReachableByCanonicalTargets(nodeMap, entryId)
+
+  for (const endingId of endingIds) {
+    if (reachable.has(endingId)) continue
+    const ending = nodeMap.get(endingId)
+    results.push({
+      severity: "blocking",
+      type: "ending_unreachable",
+      nodeId: endingId,
+      routeId: route.id,
+      message: `结局节点「${ending?.title || endingId}」无法从入口到达`,
+      detail: "从入口节点按选项出口和默认出口遍历时，无法到达该结局节点。",
+      suggestion: "检查中间节点是否缺少连接，或重新连接到该结局节点。",
+    })
+  }
+}
+
+function checkCanonicalDeadEnds(route: GalRoute, results: BranchLintResult[]): void {
+  const nodeMap = new Map(route.nodes.map((node) => [node.id, node]))
+
+  for (const node of route.nodes) {
+    if (node.type === "ending") continue
+    if (hasNodeOutgoingTarget(node, nodeMap)) continue
+    const hasChoices = (node.choices ?? []).length > 0
+    results.push({
+      severity: "medium",
+      type: "dead_end",
+      nodeId: node.id,
+      routeId: route.id,
+      message: hasChoices
+        ? `节点「${node.title}」有选项，但没有任何有效出口`
+        : `节点「${node.title}」是非结局节点但没有出口`,
+      detail: hasChoices
+        ? "该节点存在选项，但所有选项都未连接目标节点，且没有默认出口。"
+        : "普通节点需要至少一个有效选项出口或默认出口；结局节点可以没有出口。",
+      suggestion: "连接一个后续节点，或将该节点标记为 ending。",
+    })
+  }
+}
+
+function bfsReachableByCanonicalTargets(
+  nodeMap: Map<string, GalNode>,
+  startId: string,
+): Set<string> {
+  const visited = new Set<string>()
+  const queue = [startId]
+
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (!current || visited.has(current)) continue
+    visited.add(current)
+
+    const node = nodeMap.get(current)
+    if (!node) continue
+    for (const target of getNodeOutgoingTargets(node, nodeMap)) {
+      if (!visited.has(target.targetId)) queue.push(target.targetId)
     }
   }
 

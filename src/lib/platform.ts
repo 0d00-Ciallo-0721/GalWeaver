@@ -3,7 +3,12 @@ type DirectoryPickerWindow = Window & {
 }
 
 export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
+  if (typeof globalThis === "undefined") return false
+  const candidate = globalThis as typeof globalThis & {
+    isTauri?: unknown
+    __TAURI_INTERNALS__?: unknown
+  }
+  return Boolean(candidate.isTauri || candidate.__TAURI_INTERNALS__)
 }
 
 export function supportsDirectoryPicker(): boolean {

@@ -20,7 +20,7 @@ export function getNodeTypeLabel(type: string): string {
     cg: "CG",
     ending: "结局",
   }
-  return labels[type] || type
+  return labels[type] || `未归类(${type})`
 }
 
 export function getNodeStatusLabel(status: string): string {
@@ -42,5 +42,5 @@ export function getNodeTypeColor(type: string): string {
     cg: "text-pink-500",
     ending: "text-red-500",
   }
-  return colors[type] || "text-muted-foreground"
+  return colors[type] || "text-blue-500"
 }
