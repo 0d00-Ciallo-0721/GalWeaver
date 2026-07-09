@@ -129,14 +129,15 @@ async function buildOptimizationPrompt(params: GalLonglineOptimizationParams): P
     "",
     "## 硬性规则",
     "- 只允许输出优化计划 steps，不允许输出完整正文、改写正文、节点正文、节点 JSON 或可直接保存的数据。",
+    "- 只允许两种操作：改写目标节点正文（rewrite_node）、在相邻目标节点之间插入中继节点（insert_bridge_node）。",
+    "- 禁止任何涉及选项的操作：不新增、不删除、不改写、不补全、不修改选项数量。插入中继节点最多保留 1 个默认出口。",
     "- rewrite_node 步骤只能指向目标长线节点，不能指向上游边界或下游边界。",
     "- insert_bridge_node 步骤只允许建议插入在两个相邻目标长线节点之间。",
     "- 不允许计划插入到上游边界之前，也不允许计划插入到下游边界之后。",
     "- 如果需要中继节点，只能描述 intent/scope/constraints，不得生成 title/goal/summary/script 之外的真实节点数据，也不得生成正文。",
     "- skip 表示明确不建议执行修改；没有问题的节点可以不生成步骤。",
     "- 每个步骤必须能被后续 Do-Plan 阶段单独执行；不要把多个无关节点塞进一个步骤。",
-    "- 不要新增、补充、扩展或改写选项；长线节点只有一个自然推进选项是正常设计，不需要补成多个选项。",
-    "- 即使检查报告提到“缺少【选择】”“缺少结尾选项”“补充三个选项”“无法提供路径”，也必须忽略这类建议，不要把它们作为优化目标。",
+    "- 如果检查报告提到任何与选项相关的建议，必须完全忽略。长线节点的正常出口是单线推进或默认出口。",
     "",
     "## 模式约束",
     modeDirective(params.mode),
@@ -441,9 +442,20 @@ function isExecutablePlanStep(
   adjacentPairs: Set<string>,
 ): boolean {
   if (!item.reason || !item.intent || !item.scope) return false
+  // 拒绝对非插入步骤的选项相关计划：rewrite_node 和 skip 不允许涉及选项
+  if (item.type !== "insert_bridge_node" && planStepMentionsChoices(item)) return false
   if (item.type === "insert_bridge_node") {
     return Boolean(item.afterNodeId && item.beforeNodeId && adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`))
   }
   if (!item.targetNodeId || !targetIds.has(item.targetNodeId)) return false
   return item.type === "rewrite_node" || item.type === "skip"
+}
+
+function planStepMentionsChoices(item: GalLonglineOptimizationStep): boolean {
+  const text = `${item.reason}\n${item.intent}\n${item.scope}\n${item.constraints.join("\n")}`.toLowerCase()
+  return [
+    "选项", "選項", "choice", "option",
+    "分支", "分叉",
+    "三个", "三个选项",
+  ].some((keyword) => text.includes(keyword))
 }

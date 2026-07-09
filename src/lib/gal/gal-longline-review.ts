@@ -177,11 +177,16 @@ function formatNodeMeta(node: GalNode): string {
 }
 
 function formatBoundary(item: GalLonglineReviewNodeInput, mode: "beginning" | "ending"): string {
-  const script = mode === "ending"
+  const rawScript = mode === "ending"
     ? item.script.trim().slice(-1200)
     : item.script.trim().slice(0, 1200)
+  // 剥离【选择】块，防止下游边界的选项污染审稿人的判断
+  const script = rawScript.replace(/【选择】[\s\S]*$/, "（选项部分已略去，只读边界不评估选项结构）").trim()
   return [
-    formatNodeMeta(item.node),
+    `ID：${item.node.id}`,
+    `标题：${item.node.title}`,
+    `概要：${item.node.summary || "未填写"}`,
+    // 不注入 node.goal——下游边界的 goal 常含 "需要生成选项" 等设计笔记，不应喂给 AI
     mode === "ending" ? "正文结尾：" : "正文开头：",
     script || "（正文缺失）",
   ].join("\n")
@@ -336,6 +341,17 @@ export function isLonglineChoiceStructureIssue(item: Pick<GalLonglineIssue, "cat
     "add option",
     "more options",
     "only one option",
+    // 新增变体：审查报告和计划阶段常见的选项相关漏网表述
+    "结尾没有选项",
+    "結尾沒有選項",
+    "添加选项",
+    "添加選項",
+    "生成选项",
+    "生成選項",
+    "补全选项",
+    "補全選項",
+    "输出选项",
+    "輸出選項",
   ].some((keyword) => text.includes(keyword))
 }
 

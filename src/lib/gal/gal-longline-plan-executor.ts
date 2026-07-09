@@ -256,7 +256,7 @@ async function generateRewriteScript(
       content: [
         "你是 Galgame 长线剧情 Do-Plan 执行器，只能改写当前目标节点的完整正文。",
         "只输出最终正文纯文本，不输出 JSON、Markdown 代码块、解释、标题或说明。",
-        "禁止新增选项、禁止改变量、禁止改变节点目标，除非计划步骤明确允许。",
+        "禁止新增选项、禁止改变量、禁止改变节点目标。长线节点使用默认出口或单线推进，不需要选项。",
       ].join("\n"),
     },
     { role: "user", content: prompt },
