@@ -1,11 +1,14 @@
 import { streamChat, type StreamCallbacks } from "@/lib/llm-client"
 import { useWikiStore, type LlmConfig } from "@/stores/wiki-store"
-import type { GalLonglineReviewNodeInput, GalLonglineReviewReport } from "./gal-longline-review"
+import { buildGalContextPack, type GalContextPack } from "./gal-context-engine"
+import { isLonglineChoiceStructureIssue, type GalLonglineReviewNodeInput, type GalLonglineReviewReport } from "./gal-longline-review"
 import type { GalProject, GalRoute } from "./gal-types"
 
 export type GalLonglineOptimizeMode = "missing_only" | "problem_nodes" | "whole_range" | "story_enhance"
 
-export type GalLonglineOptimizeSuggestion = "keep" | "rewrite" | "patch"
+export type GalLonglineOptimizationStepType = "rewrite_node" | "insert_bridge_node" | "skip"
+export type GalLonglineOptimizationPriority = "low" | "medium" | "high"
+export type GalLonglineOptimizationRisk = "low" | "medium" | "high"
 
 export interface GalLonglineOptimizationParams {
   project: GalProject
@@ -15,34 +18,29 @@ export interface GalLonglineOptimizationParams {
   upstreamBoundary: GalLonglineReviewNodeInput | null
   targetNodes: GalLonglineReviewNodeInput[]
   downstreamBoundary: GalLonglineReviewNodeInput | null
+  projectPath?: string
   llmConfigOverride?: LlmConfig
 }
 
-export interface GalLonglineNodeOptimization {
-  nodeId: string
-  title: string
-  originalScript: string
-  optimizedScript: string
-  reason: string
-  suggestion: GalLonglineOptimizeSuggestion
-}
-
-export interface GalLonglineSuggestedNodeInsertion {
+export interface GalLonglineOptimizationStep {
   id: string
-  afterNodeId: string
-  beforeNodeId: string
+  type: GalLonglineOptimizationStepType
+  targetNodeId?: string
+  afterNodeId?: string
+  beforeNodeId?: string
   title: string
-  goal: string
-  summary: string
-  script: string
   reason: string
+  intent: string
+  scope: string
+  constraints: string[]
+  priority: GalLonglineOptimizationPriority
+  risk: GalLonglineOptimizationRisk
 }
 
 export interface GalLonglineOptimizationPlan {
   mode: GalLonglineOptimizeMode
   summary: string
-  nodeOptimizations: GalLonglineNodeOptimization[]
-  suggestedInsertions: GalLonglineSuggestedNodeInsertion[]
+  steps: GalLonglineOptimizationStep[]
 }
 
 export async function generateGalLonglineOptimizationPlan(
@@ -50,7 +48,7 @@ export async function generateGalLonglineOptimizationPlan(
 ): Promise<GalLonglineOptimizationPlan> {
   const llmConfig = params.llmConfigOverride ?? useWikiStore.getState().llmConfig
   const allowedNodeIds = buildAllowedOptimizationNodeIds(params)
-  const prompt = buildOptimizationPrompt(params)
+  const prompt = await buildOptimizationPrompt(params)
 
   let raw = ""
   let streamError: Error | null = null
@@ -66,11 +64,11 @@ export async function generateGalLonglineOptimizationPlan(
       content: [
         params.mode === "story_enhance"
           ? "你是 Galgame 剧情导演和小说编辑，擅长增强长线剧情的连贯性、沉浸感和情绪推进。"
-          : "你是 Galgame 长线剧情正文优化编辑。",
-        "你只生成优化预览方案，不保存、不新增节点、不输出 Markdown。",
+          : "你是 Galgame 长线剧情优化计划师。",
+        "你只生成结构化优化计划，不写正文、不保存、不新增节点、不输出 Markdown。",
         "必须严格输出 JSON，不能输出解释文字。",
-        "上游边界和下游边界只读，禁止改写边界节点，禁止把边界节点放入 nodeOptimizations。",
-        "允许在 suggestedInsertions 中提出过渡节点建议，但只能作为预览方案，禁止直接写入项目。",
+        "上游边界和下游边界只读，禁止把边界节点放入可执行步骤。",
+        "允许计划新增过渡节点，但只能作为 insert_bridge_node 步骤，不得生成节点正文或节点数据。",
       ].join("\n"),
     },
     {
@@ -89,57 +87,56 @@ function buildAllowedOptimizationNodeIds(params: GalLonglineOptimizationParams):
   }
   if (params.mode === "problem_nodes" && params.reviewReport) {
     return new Set([
-      ...params.reviewReport.issues.map((item) => item.nodeId),
+      ...params.reviewReport.issues
+        .filter((item) => !isLonglineChoiceStructureIssue(item))
+        .map((item) => item.nodeId),
       ...params.reviewReport.missingScripts.map((item) => item.nodeId),
       ...params.reviewReport.continuityBreaks.flatMap((item) => [item.fromNodeId, item.toNodeId]),
-      ...params.reviewReport.rewriteTargets.map((item) => item.nodeId),
+      ...params.reviewReport.rewriteTargets
+        .filter((item) => !isLonglineChoiceStructureIssue(item))
+        .map((item) => item.nodeId),
     ])
   }
   return new Set(params.targetNodes.map(({ node }) => node.id))
 }
 
-function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string {
+async function buildOptimizationPrompt(params: GalLonglineOptimizationParams): Promise<string> {
   const modeLabel = modeText(params.mode)
+  const contextReference = await buildLonglineContextReference(params)
   return [
-    `请基于检查报告生成长线剧情优化预览方案。优化模式：${modeLabel}。`,
+    `请基于检查报告生成长线剧情优化计划。优化模式：${modeLabel}。`,
     "",
     "## 输出 JSON 结构",
     JSON.stringify({
-      summary: "整体优化说明",
-      nodeOptimizations: [
+      summary: "整体优化计划说明",
+      steps: [
         {
-          nodeId: "目标节点 ID",
-          title: "节点标题",
-          optimizedScript: "AI 优化后的完整正文",
-          reason: "修改原因",
-          suggestion: "keep/rewrite/patch",
-        },
-      ],
-      suggestedInsertions: [
-        {
-          afterNodeId: "前一个目标节点 ID",
-          beforeNodeId: "后一个目标节点 ID",
-          title: "新增过渡节点标题",
-          goal: "新增节点剧情目标",
-          summary: "新增节点概要",
-          script: "新增节点完整正文",
-          reason: "为什么需要插入",
+          id: "step_1",
+          type: "rewrite_node/insert_bridge_node/skip",
+          targetNodeId: "rewrite_node 或 skip 涉及的目标节点 ID",
+          afterNodeId: "insert_bridge_node 的前一目标节点 ID",
+          beforeNodeId: "insert_bridge_node 的后一目标节点 ID",
+          title: "计划步骤标题",
+          reason: "为什么需要这个步骤",
+          intent: "这个步骤希望达成的剧情效果",
+          scope: "允许修改或新增的边界，不写具体正文",
+          constraints: ["执行时必须遵守的限制"],
+          priority: "low/medium/high",
+          risk: "low/medium/high",
         },
       ],
     }, null, 2),
     "",
     "## 硬性规则",
-    "- 只允许输出目标长线节点的优化方案。",
-    "- 不允许输出上游边界节点或下游边界节点的优化方案。",
-    "- suggestedInsertions 只允许建议插入在两个相邻目标长线节点之间。",
-    "- 不允许插入到上游边界之前，也不允许插入到下游边界之后。",
-    "- suggestedInsertions 必须包含完整 title、goal、summary、script、reason；没有完整正文就不要输出该建议。",
-    "- 如果需要中继节点，必须基于前后相邻目标节点生成基础信息，并确保剧情入口承接 afterNodeId、剧情出口导向 beforeNodeId。",
-    "- suggestedInsertions 只是预览建议，不会自动写入 project。",
-    "- optimizedScript 必须是该目标节点的完整正文，不要只给片段。",
-    "- suggestion 只能是 keep、rewrite、patch。",
-    "- keep 表示原文基本保留；rewrite 表示建议整段重写；patch 表示局部补丁式优化。",
-    "- 如果某个目标节点无需优化，可以不放入 nodeOptimizations，或放入 suggestion=keep 且 optimizedScript 等于原文。",
+    "- 只允许输出优化计划 steps，不允许输出完整正文、改写正文、节点正文、节点 JSON 或可直接保存的数据。",
+    "- rewrite_node 步骤只能指向目标长线节点，不能指向上游边界或下游边界。",
+    "- insert_bridge_node 步骤只允许建议插入在两个相邻目标长线节点之间。",
+    "- 不允许计划插入到上游边界之前，也不允许计划插入到下游边界之后。",
+    "- 如果需要中继节点，只能描述 intent/scope/constraints，不得生成 title/goal/summary/script 之外的真实节点数据，也不得生成正文。",
+    "- skip 表示明确不建议执行修改；没有问题的节点可以不生成步骤。",
+    "- 每个步骤必须能被后续 Do-Plan 阶段单独执行；不要把多个无关节点塞进一个步骤。",
+    "- 不要新增、补充、扩展或改写选项；长线节点只有一个自然推进选项是正常设计，不需要补成多个选项。",
+    "- 即使检查报告提到“缺少【选择】”“缺少结尾选项”“补充三个选项”“无法提供路径”，也必须忽略这类建议，不要把它们作为优化目标。",
     "",
     "## 模式约束",
     modeDirective(params.mode),
@@ -162,6 +159,9 @@ function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string 
     `路线标题：${params.route.title}`,
     `路线主题：${params.route.theme || "未填写"}`,
     "",
+    "## 项目核心上下文参考（防止剧情跑偏，必须遵守）",
+    contextReference,
+    "",
     "## 检查报告",
     formatReviewReport(params.reviewReport),
     "",
@@ -177,17 +177,72 @@ function buildOptimizationPrompt(params: GalLonglineOptimizationParams): string 
   ].join("\n")
 }
 
+async function buildLonglineContextReference(params: GalLonglineOptimizationParams): Promise<string> {
+  const anchorNode = params.targetNodes[0]?.node
+  if (!params.projectPath || !anchorNode) {
+    return "未提供项目路径；仅使用下方长线节点、边界节点、项目 premise 与 globalRules。"
+  }
+  try {
+    const pack = await buildGalContextPack(
+      params.projectPath,
+      `为长线剧情「${params.route.title}」生成${modeText(params.mode)}方案`,
+      params.route.id,
+      anchorNode.id,
+    )
+    return formatContextReference(pack)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return `项目核心上下文加载失败：${message}。请仅使用下方长线节点、边界节点、项目 premise 与 globalRules。`
+  }
+}
+
+function formatContextReference(pack: GalContextPack): string {
+  const sections: string[] = []
+  const add = (title: string, content: string, maxLength: number) => {
+    const text = content.trim()
+    if (text) sections.push(`### ${title}\n${limitContextText(text, maxLength)}`)
+  }
+
+  add("项目灵魂文档（写作风格与硬规则）", pack.soulDoc, 5000)
+  add("作品大纲与世界观", pack.outline, 7000)
+  add("角色状态（来自项目记忆库）", pack.novelCharacterStates, 5000)
+  add("角色档案", pack.characterProfiles, 5000)
+  add("项目设定文档", pack.projectDocs, 3000)
+  add("Gal 全局设定", pack.premise, 2500)
+  add("不可违背的规则", pack.globalRules, 3000)
+  add("当前线路主题", pack.routeTheme, 1500)
+  add("路径摘要（从入口到当前）", pack.pathSummary, 3000)
+  add("当前变量状态", pack.variableState, 2000)
+  add("角色情绪", pack.characterMoods, 2000)
+  add("已获线索", pack.acquiredClues, 2000)
+  add("角色认知（谁知道什么）", pack.characterCognition, 3000)
+
+  return sections.length
+    ? [
+        "这些内容优先级高于泛化剧情套路。优化或扩写时不得推翻人物关系、世界观、大纲走向、角色认知和既有规则。",
+        sections.join("\n\n"),
+      ].join("\n\n")
+    : "未读取到额外核心上下文；仅使用下方长线节点、边界节点、项目 premise 与 globalRules。"
+}
+
+function limitContextText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text
+  const headLength = Math.floor(maxLength * 0.65)
+  const tailLength = maxLength - headLength
+  return `${text.slice(0, headLength).trim()}\n\n……（中间内容已截断，保留首尾以防跑偏）……\n\n${text.slice(-tailLength).trim()}`
+}
+
 function modeDirective(mode: GalLonglineOptimizeMode): string {
   if (mode === "missing_only") {
-    return "- 只为正文缺失的目标节点生成 optimizedScript；其他节点不需要输出。"
+    return "- 只为正文缺失的目标节点生成 rewrite_node 计划步骤；其他节点不需要输出。"
   }
   if (mode === "problem_nodes") {
-    return "- 只优化检查报告中 issues、continuityBreaks、rewriteTargets 涉及的目标节点；没有问题的节点不需要输出。"
+    return "- 只为检查报告中 issues、continuityBreaks、rewriteTargets 涉及的目标节点或相邻断点生成计划步骤；没有问题的节点不需要输出。"
   }
   if (mode === "story_enhance") {
-    return "- 作为剧情导演增强整段目标长线：允许扩写目标节点正文，允许在相邻目标节点之间建议中继节点，但必须保持单线结构和原剧情方向。"
+    return "- 作为剧情导演为整段目标长线制定增强计划：可以计划扩写目标节点，也可以计划在相邻目标节点之间增加中继节点，但必须保持单线结构和原剧情方向。"
   }
-  return "- 可以优化整段目标长线，并可在确有必要时建议新增过渡节点；新增节点只能放在 suggestedInsertions。"
+  return "- 可以为整段目标长线制定优化计划，并可在确有必要时加入 insert_bridge_node 步骤。"
 }
 
 function modeText(mode: GalLonglineOptimizeMode): string {
@@ -201,13 +256,12 @@ function storyEnhancementDirective(): string {
   return [
     "## 剧情增强/扩写要求",
     "- 目标不是只纠错，而是让这段长线更好看、更顺、更有情绪价值。",
-    "- 可以扩写目标节点正文，补充动作、对话、心理反应、场景细节和结尾钩子。",
-    "- 每个被改写的目标节点必须仍然服务原 node.goal，不得改变玩家选择导致的核心剧情结果。",
-    "- 第一目标节点必须自然承接上游边界；最后目标节点必须自然导向下游边界。",
-    "- 中间目标节点要持续推进事件，避免原地重复。",
-    "- 如果两个相邻目标节点之间缺少情绪、时间、地点或行动过渡，可以建议新增一个中继节点。",
-    "- 中继节点不能新增分叉、不能新增变量、不能改变前后节点结论；它只负责让 A -> B 更自然。",
-    "- 中继节点 script 必须是完整正文，且正文开头承接 afterNodeId，正文结尾导向 beforeNodeId。",
+    "- 可以计划扩写目标节点正文，补充动作、对话、心理反应、场景细节和结尾钩子，但本阶段不能写出具体正文。",
+    "- 每个 rewrite_node 计划必须仍然服务原 node.goal，不得改变玩家选择导致的核心剧情结果。",
+    "- 第一目标节点计划必须自然承接上游边界；最后目标节点计划必须自然导向下游边界。",
+    "- 中间目标节点计划要持续推进事件，避免原地重复。",
+    "- 如果两个相邻目标节点之间缺少情绪、时间、地点或行动过渡，可以生成 insert_bridge_node 计划。",
+    "- insert_bridge_node 不能新增分叉、不能新增变量、不能改变前后节点结论；它只负责让 A -> B 更自然。",
   ].join("\n")
 }
 
@@ -216,10 +270,10 @@ function formatReviewReport(report: GalLonglineReviewReport | null): string {
   return [
     `范围结论：${report.rangeSummary}`,
     `正文缺失：${report.missingScripts.map((item) => `${item.title}(${item.nodeId})`).join("、") || "无"}`,
-    `问题：${report.issues.map((item) => `${item.title || item.nodeId}：${item.detail}`).join("\n") || "无"}`,
+    `问题：${report.issues.filter((item) => !isLonglineChoiceStructureIssue(item)).map((item) => `${item.title || item.nodeId}：${item.detail}`).join("\n") || "无"}`,
     `连续性断点：${report.continuityBreaks.map((item) => `${item.fromNodeId}->${item.toNodeId}：${item.detail}`).join("\n") || "无"}`,
     `建议过渡节点：${report.suggestedInsertions.map((item) => `${item.afterNodeId}->${item.beforeNodeId}：${item.title}；${item.reason}`).join("\n") || "无"}`,
-    `建议改写目标：${report.rewriteTargets.map((item) => `${item.title || item.nodeId}：${item.reason}`).join("\n") || "无"}`,
+    `建议改写目标：${report.rewriteTargets.filter((item) => !isLonglineChoiceStructureIssue(item)).map((item) => `${item.title || item.nodeId}：${item.reason}`).join("\n") || "无"}`,
   ].join("\n")
 }
 
@@ -317,69 +371,79 @@ function normalizeOptimizationPlan(
   params: GalLonglineOptimizationParams,
   targetIds: Set<string>,
 ): GalLonglineOptimizationPlan {
-  const originalById = new Map(params.targetNodes.map((item) => [item.node.id, item]))
-  const nodeOptimizations = Array.isArray(parsed.nodeOptimizations)
-    ? parsed.nodeOptimizations.map((item) => {
-        const nodeId = String(item?.nodeId ?? "").trim()
-        const original = originalById.get(nodeId)
-        return {
-          nodeId,
-          title: String(item?.title ?? original?.node.title ?? nodeId).trim() || nodeId,
-          originalScript: original?.script ?? "",
-          optimizedScript: String(item?.optimizedScript ?? "").trim(),
-          reason: String(item?.reason ?? "").trim(),
-          suggestion: normalizeSuggestion(item?.suggestion),
-        }
-      }).filter((item) => targetIds.has(item.nodeId) && item.optimizedScript)
-    : []
-
   return {
     mode: params.mode,
-    summary: String(parsed.summary ?? "").trim() || "AI 未返回整体优化说明。",
-    nodeOptimizations,
-    suggestedInsertions: normalizeSuggestedInsertions(parsed.suggestedInsertions, params),
+    summary: String(parsed.summary ?? "").trim() || "AI 未返回整体优化计划说明。",
+    steps: normalizePlanSteps(parsed.steps, params, targetIds),
   }
 }
 
-function normalizeSuggestion(value: unknown): GalLonglineOptimizeSuggestion {
-  return value === "keep" || value === "rewrite" || value === "patch" ? value : "patch"
-}
-
-function normalizeSuggestedInsertions(
+function normalizePlanSteps(
   value: unknown,
   params: GalLonglineOptimizationParams,
-): GalLonglineSuggestedNodeInsertion[] {
+  targetIds: Set<string>,
+): GalLonglineOptimizationStep[] {
   if (!Array.isArray(value)) return []
   const adjacentPairs = new Set<string>()
   for (let index = 0; index < params.targetNodes.length - 1; index += 1) {
     adjacentPairs.add(`${params.targetNodes[index].node.id}->${params.targetNodes[index + 1].node.id}`)
   }
-  const normalized = value.map((item, index) => {
+  return value.map((item, index) => {
+    const type = normalizeStepType(item?.type)
+    const targetNodeId = String(item?.targetNodeId ?? item?.nodeId ?? "").trim()
     const afterNodeId = String(item?.afterNodeId ?? "").trim()
     const beforeNodeId = String(item?.beforeNodeId ?? "").trim()
     return {
-      id: `insert_${afterNodeId}_${beforeNodeId}_${index}`,
-      afterNodeId,
-      beforeNodeId,
-      title: String(item?.title ?? "").trim(),
-      goal: String(item?.goal ?? "").trim(),
-      summary: String(item?.summary ?? "").trim(),
-      script: String(item?.script ?? "").trim(),
+      id: String(item?.id ?? "").trim() || `step_${index + 1}`,
+      type,
+      targetNodeId: targetNodeId || undefined,
+      afterNodeId: afterNodeId || undefined,
+      beforeNodeId: beforeNodeId || undefined,
+      title: String(item?.title ?? "").trim() || defaultStepTitle(type, targetNodeId, afterNodeId, beforeNodeId),
       reason: String(item?.reason ?? "").trim(),
+      intent: String(item?.intent ?? "").trim(),
+      scope: String(item?.scope ?? "").trim(),
+      constraints: Array.isArray(item?.constraints)
+        ? item.constraints.map((constraint: unknown) => String(constraint ?? "").trim()).filter(Boolean)
+        : [],
+      priority: normalizePriority(item?.priority),
+      risk: normalizeRisk(item?.risk),
     }
-  })
-  const incompleteAdjacent = normalized.filter((item) =>
-    adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`)
-    && (!item.title || !item.goal || !item.summary || !item.script || !item.reason)
-  )
-  if (params.mode === "story_enhance" && incompleteAdjacent.length > 0) {
-    throw new Error("剧情增强生成了不完整的中继节点建议，已触发自动重试。中继节点必须包含标题、目标、摘要、完整正文和原因。")
+  }).filter((item) => isExecutablePlanStep(item, targetIds, adjacentPairs))
+}
+
+function normalizeStepType(value: unknown): GalLonglineOptimizationStepType {
+  return value === "rewrite_node" || value === "insert_bridge_node" || value === "skip" ? value : "rewrite_node"
+}
+
+function normalizePriority(value: unknown): GalLonglineOptimizationPriority {
+  return value === "low" || value === "medium" || value === "high" ? value : "medium"
+}
+
+function normalizeRisk(value: unknown): GalLonglineOptimizationRisk {
+  return value === "low" || value === "medium" || value === "high" ? value : "medium"
+}
+
+function defaultStepTitle(
+  type: GalLonglineOptimizationStepType,
+  targetNodeId: string,
+  afterNodeId: string,
+  beforeNodeId: string,
+): string {
+  if (type === "insert_bridge_node") return `新增中继节点：${afterNodeId || "?"} → ${beforeNodeId || "?"}`
+  if (type === "skip") return `跳过：${targetNodeId || "未指定节点"}`
+  return `改写节点：${targetNodeId || "未指定节点"}`
+}
+
+function isExecutablePlanStep(
+  item: GalLonglineOptimizationStep,
+  targetIds: Set<string>,
+  adjacentPairs: Set<string>,
+): boolean {
+  if (!item.reason || !item.intent || !item.scope) return false
+  if (item.type === "insert_bridge_node") {
+    return Boolean(item.afterNodeId && item.beforeNodeId && adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`))
   }
-  return normalized.filter((item) =>
-    adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`)
-    && item.title
-    && item.goal
-    && item.summary
-    && item.script,
-  )
+  if (!item.targetNodeId || !targetIds.has(item.targetNodeId)) return false
+  return item.type === "rewrite_node" || item.type === "skip"
 }

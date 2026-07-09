@@ -125,7 +125,8 @@ function buildLonglineReviewPrompt(
     "- missingScripts 只列出目标长线节点正文缺失。",
     "- 如果建议新增过渡节点，只能放在 suggestedInsertions，不要直接生成节点数据。",
     "- 长线剧情目标节点允许只有一个自然推进选项；不要把“选项数量不足”“只有一个选项”“不利于分支”当成问题。",
-    "- 本检查只判断正文连续性，不检查选项数量、分支丰富度或玩家选择数量。",
+    "- 不要建议新增、补充、扩展或改写选项；不要把“缺少【选择】部分”“缺少结尾选项”“无法提供路径”当成问题。",
+    "- 本检查只判断正文连续性，不检查选项数量、分支丰富度、玩家选择数量或选项完整度。",
     "- 如果没有问题，对应数组输出空数组。",
     "",
     "## 检查重点",
@@ -242,7 +243,7 @@ function normalizeIssues(value: unknown, targetIds: Set<string>): GalLonglineIss
     severity: normalizeSeverity(item?.severity),
     category: String(item?.category ?? "").trim(),
     detail: String(item?.detail ?? "").trim(),
-  })).filter((item) => targetIds.has(item.nodeId) && item.detail && !isChoiceCountIssue(item))
+  })).filter((item) => targetIds.has(item.nodeId) && item.detail && !isLonglineChoiceStructureIssue(item))
 }
 
 function normalizeBreaks(value: unknown, targetIds: Set<string>): GalLonglineContinuityBreak[] {
@@ -272,30 +273,68 @@ function normalizeRewriteTargets(value: unknown, targetIds: Set<string>): GalLon
     nodeId: String(item?.nodeId ?? "").trim(),
     title: String(item?.title ?? "").trim(),
     reason: String(item?.reason ?? "").trim(),
-  })).filter((item) => targetIds.has(item.nodeId) && item.reason)
+  })).filter((item) => targetIds.has(item.nodeId) && item.reason && !isLonglineChoiceStructureIssue(item))
 }
 
 function normalizeSeverity(value: unknown): GalLonglineIssue["severity"] {
   return value === "info" || value === "warning" || value === "error" ? value : "warning"
 }
 
-function isChoiceCountIssue(item: GalLonglineIssue): boolean {
-  const text = `${item.category}\n${item.detail}`.toLowerCase()
+export function isLonglineChoiceStructureIssue(item: Pick<GalLonglineIssue, "category" | "detail"> | Pick<GalLonglineRewriteTarget, "reason">): boolean {
+  const text = "reason" in item
+    ? item.reason.toLowerCase()
+    : `${item.category}\n${item.detail}`.toLowerCase()
   return [
     "选项数量",
     "選項數量",
     "选项不足",
     "選項不足",
+    "选项缺失",
+    "選項缺失",
     "只有一个选项",
     "只有一個選項",
     "只提供了一个选项",
     "只提供了一個選項",
     "未提供任何选项",
     "未提供任何選項",
+    "缺少【选择】",
+    "缺少【選擇】",
+    "缺少选择",
+    "缺少選擇",
+    "缺少结尾选项",
+    "缺少結尾選項",
+    "结尾选项",
+    "結尾選項",
+    "添加结尾选项",
+    "添加結尾選項",
+    "新增选项",
+    "新增選項",
+    "增加选项",
+    "增加選項",
+    "补充选项",
+    "補充選項",
+    "补全选项",
+    "補全選項",
+    "补充三个选项",
+    "補充三個選項",
+    "补充三项选项",
+    "補充三項選項",
+    "三个选项",
+    "三個選項",
+    "三项选项",
+    "三項選項",
     "不利于线路分支",
     "不利於線路分支",
+    "无法提供路径",
+    "無法提供路徑",
+    "无法导向下游",
+    "無法導向下游",
     "player choice",
     "choice count",
+    "missing choice",
+    "add choice",
+    "add option",
+    "more options",
     "only one option",
   ].some((keyword) => text.includes(keyword))
 }

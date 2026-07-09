@@ -9,6 +9,7 @@ import { FileDown, Flag, GitBranch, Hand, Loader2, Maximize2, Minus, Plus, Spark
 import { useGalStore, type GalBoardHighlightRole } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { generateRelayNodeCard } from "@/lib/gal/gal-node-generation"
+import { insertRelayNodeIntoProject } from "@/lib/gal/gal-relay-node-insert"
 import { detectGalGraphIssues, getNodeOutgoingTargets } from "@/lib/gal/gal-graph-normalize"
 import { loadGalProject, saveGalProject } from "@/lib/gal/gal-storage"
 import type { GalNode, GalRoute } from "@/lib/gal/gal-types"
@@ -425,77 +426,28 @@ export function GalRouteBoard({
         throw new Error("插入失败：原线路连接已发生变化")
       }
 
-      const now = new Date().toISOString()
-      const relayId = createUniqueBoardNodeId(routeToSave, "node_relay")
-      const relayChoiceId = `choice_relay_${Date.now().toString(36)}`
       const sourcePosition = board.nodeMap.get(parentNode.id)
       const targetPosition = board.nodeMap.get(childNode.id)
       const relayPosition = {
         x: Math.round(((sourcePosition?.worldX ?? 80) + (targetPosition?.worldX ?? 520)) / 2),
         y: Math.round(((sourcePosition?.worldY ?? 80) + (targetPosition?.worldY ?? 80)) / 2),
       }
-
-      for (const choice of parentNode.choices ?? []) {
-        if (choice.nextNodeId === childNode.id) choice.nextNodeId = relayId
-      }
-      parentNode.children = Array.from(new Set([
-        ...(parentNode.children ?? []).filter((childId) => childId !== childNode.id),
-        relayId,
-      ]))
-      childNode.parents = Array.from(new Set([
-        ...(childNode.parents ?? []).filter((parentId) => parentId !== parentNode.id),
-        relayId,
-      ]))
-      parentNode.updatedAt = now
-      childNode.updatedAt = now
-
-      routeToSave.nodes.push({
-        id: relayId,
+      const result = insertRelayNodeIntoProject({
+        project: galProject,
         routeId: routeToSave.id,
-        title: relayCard.title,
-        type: "daily",
-        status: "card",
-        parents: [parentNode.id],
-        children: [childNode.id],
-        goal: relayCard.goal,
-        summary: relayCard.summary,
-        boardPosition: relayPosition,
-        scriptPath: `nodes/${routeToSave.id}/${relayId}.md`,
-        incomingState: cloneStateSnapshot(childNode.incomingState),
-        choices: [{
-          id: relayChoiceId,
-          text: relayCard.entryChoiceText,
-          emotionalIntent: relayCard.entryChoiceIntent,
-          effects: [],
-          nextNodeId: childNode.id,
-          nextNodeTitle: childNode.title,
-          nextNodeGoal: childNode.goal,
-        }],
-        memoryScope: "node",
-        characters: relayCard.characters,
-        scene: relayCard.scene,
-        clueIds: [],
-        sequence: Math.max(0, ...routeToSave.nodes.map((item) => item.sequence || 0)) + 1,
-        createdAt: now,
-        updatedAt: now,
+        afterNodeId: parentNode.id,
+        beforeNodeId: childNode.id,
+        requireNodeIdsAdjacency: false,
+        requireSingleDirectConnection: false,
+        draft: {
+          ...relayCard,
+          script: "",
+          status: "card",
+          boardPosition: relayPosition,
+        },
       })
-
-      for (const pathRoute of galProject.routes) {
-        if (!Array.isArray(pathRoute.nodeIds)) continue
-        const nextNodeIds: string[] = []
-        for (let index = 0; index < pathRoute.nodeIds.length; index += 1) {
-          const nodeId = pathRoute.nodeIds[index]
-          nextNodeIds.push(nodeId)
-          if (nodeId === parentNode.id && pathRoute.nodeIds[index + 1] === childNode.id) {
-            nextNodeIds.push(relayId)
-          }
-        }
-        pathRoute.nodeIds = nextNodeIds
-      }
-
-      galProject.updatedAt = now
       await saveGalProject(project.path, galProject)
-      setPositions((current) => ({ ...current, [relayId]: relayPosition }))
+      setPositions((current) => ({ ...current, [result.node.id]: relayPosition }))
       galStore.setProject(await loadGalProject(project.path))
       setBoardMessage(`中继节点「${relayCard.title}」已插入，正文保持为空。`)
     } catch (err) {
@@ -1090,34 +1042,4 @@ function sanitizeBoardPositions(
     clean[nodeId] = { x: position.x, y: position.y }
   }
   return clean
-}
-
-function createUniqueBoardNodeId(route: GalRoute, prefix: string): string {
-  const existingIds = new Set((route.nodes ?? []).map((node) => node.id))
-  let nodeId = ""
-  do {
-    nodeId = `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
-  } while (existingIds.has(nodeId))
-  return nodeId
-}
-
-function cloneStateSnapshot(state: GalNode["incomingState"]): GalNode["incomingState"] {
-  return {
-    variables: { ...(state?.variables ?? {}) },
-    characterCognition: Object.fromEntries(
-      Object.entries(state?.characterCognition ?? {}).map(([character, cognition]) => [
-        character,
-        {
-          knows: [...(cognition.knows ?? [])],
-          doesNotKnow: [...(cognition.doesNotKnow ?? [])],
-          readerKnowsButCharacterDoesNot: [...(cognition.readerKnowsButCharacterDoesNot ?? [])],
-        },
-      ]),
-    ),
-    acquiredClueIds: [...(state?.acquiredClueIds ?? [])],
-    seenCgIds: [...(state?.seenCgIds ?? [])],
-    visitedNodeIds: [...(state?.visitedNodeIds ?? [])],
-    currentScene: state?.currentScene ?? "",
-    characterMoods: { ...(state?.characterMoods ?? {}) },
-  }
 }

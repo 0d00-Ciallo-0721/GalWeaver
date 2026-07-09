@@ -132,13 +132,26 @@ export {
   generateGalLonglineOptimizationPlan,
 } from "./gal-longline-optimization"
 export type {
-  GalLonglineNodeOptimization,
   GalLonglineOptimizationParams,
   GalLonglineOptimizationPlan,
+  GalLonglineOptimizationPriority,
+  GalLonglineOptimizationRisk,
+  GalLonglineOptimizationStep,
+  GalLonglineOptimizationStepType,
   GalLonglineOptimizeMode,
-  GalLonglineOptimizeSuggestion,
-  GalLonglineSuggestedNodeInsertion,
 } from "./gal-longline-optimization"
+
+export {
+  executeGalLonglinePlan,
+  insertBridgeNode,
+  rewriteNodeScript,
+} from "./gal-longline-plan-executor"
+export type {
+  GalLonglinePlanExecutionReport,
+  GalLonglinePlanExecutionStep,
+  GalLonglinePlanExecutorParams,
+  GalLonglinePlanStepStatus,
+} from "./gal-longline-plan-executor"
 
 export {
   routeGalTask,

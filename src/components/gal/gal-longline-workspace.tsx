@@ -1,18 +1,21 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { AlertTriangle, ArrowLeft, BookOpen, GitBranch, Lock, RefreshCw, Sparkles } from "lucide-react"
 import { useGalStore, type GalBoardHighlightState } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { detectGalLonglineRange, type GalLonglineRange, type GalLonglineStop } from "@/lib/gal/gal-longline-range"
 import {
   generateGalLonglineOptimizationPlan,
-  type GalLonglineNodeOptimization,
   type GalLonglineOptimizationPlan,
   type GalLonglineOptimizeMode,
-  type GalLonglineSuggestedNodeInsertion,
 } from "@/lib/gal/gal-longline-optimization"
+import {
+  executeGalLonglinePlan,
+  type GalLonglinePlanExecutionReport,
+  type GalLonglinePlanExecutionStep,
+} from "@/lib/gal/gal-longline-plan-executor"
 import { reviewGalLongline, type GalLonglineReviewReport } from "@/lib/gal/gal-longline-review"
-import { deleteNodeScript, loadGalProject, loadNodeScript, saveGalProject, saveNodeScript } from "@/lib/gal/gal-storage"
-import type { GalChoice, GalNode, GalNodeStatus, GalRoute, GalStateSnapshot } from "@/lib/gal/gal-types"
+import { deleteNodeScript, loadNodeScript, saveGalProject, saveNodeScript } from "@/lib/gal/gal-storage"
+import type { GalNode, GalNodeStatus, GalProject, GalRoute } from "@/lib/gal/gal-types"
 import { GalRouteBoard } from "./gal-route-board"
 
 interface GalLonglineWorkspaceProps {
@@ -27,28 +30,29 @@ type ChainItem = {
   role: "upstream" | "target" | "downstream"
 }
 
-type OptimizationDecision = "pending" | "accept" | "keep" | "regenerate"
-type AppliedSnapshot = {
+type RewriteUndoSnapshot = {
   routeId: string
   nodeId: string
   oldScript: string
   oldStatus: GalNodeStatus
   oldUpdatedAt: string
 }
-type AppliedInsertionSnapshot = {
-  suggestionId: string
+
+type InsertUndoSnapshot = {
   routeId: string
-  newNodeId: string
+  insertedNodeId?: string
   afterNodeId: string
   beforeNodeId: string
   afterChildren: string[]
-  afterChoices: GalChoice[]
+  afterChoices: GalNode["choices"]
   afterUpdatedAt: string
   beforeParents: string[]
   beforeUpdatedAt: string
-  routeSequences: Array<{ nodeId: string; sequence: number }>
   routeNodeIds: Record<string, string[]>
+  routeSequences: Array<{ nodeId: string; sequence: number }>
 }
+
+type StepUndoSnapshot = RewriteUndoSnapshot | InsertUndoSnapshot
 
 export function GalLonglineWorkspace({
   route,
@@ -58,6 +62,7 @@ export function GalLonglineWorkspace({
 }: GalLonglineWorkspaceProps) {
   const wikiProject = useWikiStore((s) => s.project)
   const galStore = useGalStore()
+  const undoSnapshotsRef = useRef<Record<string, StepUndoSnapshot>>({})
   const range = useMemo(
     () => route ? detectGalLonglineRange(route, startNodeId) : null,
     [route, startNodeId],
@@ -80,14 +85,13 @@ export function GalLonglineWorkspace({
   const [optimizationPlan, setOptimizationPlan] = useState<GalLonglineOptimizationPlan | null>(null)
   const [optimizationError, setOptimizationError] = useState<string | null>(null)
   const [optimizing, setOptimizing] = useState(false)
-  const [optimizationDecisions, setOptimizationDecisions] = useState<Record<string, OptimizationDecision>>({})
-  const [appliedSnapshots, setAppliedSnapshots] = useState<Record<string, AppliedSnapshot>>({})
-  const [applying, setApplying] = useState(false)
-  const [applyMessage, setApplyMessage] = useState<string | null>(null)
-  const [applyError, setApplyError] = useState<string | null>(null)
-  const [discardedInsertionIds, setDiscardedInsertionIds] = useState<string[]>([])
-  const [appliedInsertionIds, setAppliedInsertionIds] = useState<string[]>([])
-  const [appliedInsertionSnapshots, setAppliedInsertionSnapshots] = useState<Record<string, AppliedInsertionSnapshot>>({})
+  const [selectedPlanStepIds, setSelectedPlanStepIds] = useState<Set<string>>(new Set())
+  const [planActionMessage, setPlanActionMessage] = useState<string | null>(null)
+  const [executionReport, setExecutionReport] = useState<GalLonglinePlanExecutionReport | null>(null)
+  const [executingPlan, setExecutingPlan] = useState(false)
+  const [undoneStepIds, setUndoneStepIds] = useState<Set<string>>(new Set())
+  const [undoSnapshots, setUndoSnapshots] = useState<Record<string, StepUndoSnapshot>>({})
+  const [compareStepId, setCompareStepId] = useState<string | null>(null)
 
   useEffect(() => {
     if (!chainItems.some((item) => item.node.id === activeNodeId)) {
@@ -104,11 +108,9 @@ export function GalLonglineWorkspace({
       range,
       reviewReport,
       optimizationPlan,
-      new Set(discardedInsertionIds),
-      new Set(appliedInsertionIds),
     ))
     return () => galStore.clearBoardHighlight()
-  }, [range, reviewReport, optimizationPlan, discardedInsertionIds, appliedInsertionIds])
+  }, [range, reviewReport, optimizationPlan])
 
   useEffect(() => {
     if (!wikiProject?.path || chainItems.length === 0) {
@@ -134,9 +136,6 @@ export function GalLonglineWorkspace({
 
   const activeItem = chainItems.find((item) => item.node.id === activeNodeId)
   const activeScript = activeItem ? scripts[activeItem.node.id] ?? "" : ""
-  const activeOptimization = activeItem
-    ? optimizationPlan?.nodeOptimizations.find((item) => item.nodeId === activeItem.node.id) ?? null
-    : null
   const handleReview = async () => {
     if (!route || !range || !galStore.project) return
     setReviewing(true)
@@ -172,7 +171,7 @@ export function GalLonglineWorkspace({
     }
   }
   const handleGenerateOptimization = async () => {
-    if (!route || !range || !galStore.project) return
+    if (!route || !range || !galStore.project || !wikiProject?.path) return
     setOptimizing(true)
     setOptimizationError(null)
     try {
@@ -181,7 +180,7 @@ export function GalLonglineWorkspace({
           title: optimizeMode === "story_enhance" ? "生成剧情增强方案" : "生成长线优化方案",
           detail: optimizeMode === "story_enhance"
             ? "正在增强长线剧情连贯性与体验感，不会保存项目..."
-            : "正在生成正文优化预览，不会保存项目...",
+            : "正在生成结构化优化计划，不会保存项目...",
         },
         async (task) => {
           task.update(optimizeMode === "story_enhance" ? "正在组织剧情增强上下文..." : "正在组织长线优化上下文...")
@@ -197,314 +196,139 @@ export function GalLonglineWorkspace({
             downstreamBoundary: range.downstreamBoundary
               ? { node: range.downstreamBoundary, script: scripts[range.downstreamBoundary.id] ?? "" }
               : null,
+            projectPath: wikiProject.path,
           })
           task.update(optimizeMode === "story_enhance" ? "剧情增强方案已生成。" : "优化方案已生成。")
           return result
         },
       )
       setOptimizationPlan(plan)
-      setOptimizationDecisions(Object.fromEntries(plan.nodeOptimizations.map((item) => [item.nodeId, "pending"])))
-      setDiscardedInsertionIds([])
-      setAppliedInsertionIds([])
+      setSelectedPlanStepIds(new Set(plan.steps.filter(shouldSelectPlanStepByDefault).map((step) => step.id)))
+      setPlanActionMessage(null)
     } catch (err) {
       setOptimizationError(err instanceof Error ? err.message : String(err))
     } finally {
       setOptimizing(false)
     }
   }
-  const setOptimizationDecision = (nodeId: string, decision: OptimizationDecision) => {
-    setOptimizationDecisions((prev) => ({ ...prev, [nodeId]: decision }))
+  const setPlanStepSelected = (stepId: string, selected: boolean) => {
+    setSelectedPlanStepIds((prev) => {
+      const next = new Set(prev)
+      if (selected) next.add(stepId)
+      else next.delete(stepId)
+      return next
+    })
+    setPlanActionMessage(null)
+    setExecutionReport(null)
   }
-  const applyOptimizations = async (mode: "selected" | "all") => {
-    if (!wikiProject?.path || !route || !range || !optimizationPlan) return
-    const targetIds = new Set(range.targetNodes.map((node) => node.id))
-    const selected = optimizationPlan.nodeOptimizations.filter((item) =>
-      targetIds.has(item.nodeId)
-      && (mode === "all" || optimizationDecisions[item.nodeId] === "accept")
-      && item.optimizedScript.trim(),
-    )
-    if (selected.length === 0) {
-      setApplyError(mode === "all" ? "当前没有可应用的优化正文。" : "请先选择要采用优化的节点。")
+  const handleExecuteSelectedPlan = async () => {
+    if (!route || !range || !galStore.project || !optimizationPlan || !wikiProject?.path || executingPlan) return
+    setExecutingPlan(true)
+    setPlanActionMessage(null)
+    setExecutionReport(null)
+    setUndoneStepIds(new Set())
+    setUndoSnapshots({})
+    setCompareStepId(null)
+    undoSnapshotsRef.current = {}
+    try {
+      const report = await galStore.runAiTask(
+        {
+          title: "执行长线优化计划",
+          detail: "正在按所选步骤串行执行计划骨架...",
+        },
+        async (task) => {
+          const result = await executeGalLonglinePlan({
+            projectPath: wikiProject.path,
+            project: galStore.project!,
+            route,
+            plan: optimizationPlan,
+            selectedStepIds: selectedPlanStepIds,
+            scripts,
+            upstreamBoundary: range.upstreamBoundary
+              ? { node: range.upstreamBoundary, script: scripts[range.upstreamBoundary.id] ?? "" }
+              : null,
+            downstreamBoundary: range.downstreamBoundary
+              ? { node: range.downstreamBoundary, script: scripts[range.downstreamBoundary.id] ?? "" }
+              : null,
+            onStepUpdate: (step, index) => {
+              task.update(`正在处理第 ${index + 1} 个计划步骤：${step.title}`)
+              if (step.status === "running") {
+                const planStep = optimizationPlan.steps.find((item) => item.id === step.stepId)
+                const snapshot = planStep ? createUndoSnapshot(planStep, galStore.project!, scripts) : null
+                if (snapshot) {
+                  undoSnapshotsRef.current[step.stepId] = snapshot
+                  setUndoSnapshots((prev) => ({ ...prev, [step.stepId]: snapshot }))
+                }
+              }
+              if (step.nodeId && step.updatedScript) {
+                setScripts((prev) => ({ ...prev, [step.nodeId!]: step.updatedScript! }))
+              }
+              setExecutionReport((prev) => mergeExecutionStep(prev, step, index))
+            },
+          })
+          task.update("计划执行骨架已完成。")
+          return result
+        },
+      )
+      setExecutionReport(report)
+      const updatedScripts = Object.fromEntries(
+        report.steps
+          .filter((step) => step.nodeId && step.updatedScript)
+          .map((step) => [step.nodeId!, step.updatedScript!]),
+      )
+      if (Object.keys(updatedScripts).length > 0) {
+        setScripts((prev) => ({ ...prev, ...updatedScripts }))
+      }
+      galStore.setProject(galStore.project ? { ...galStore.project } : null)
+      setPlanActionMessage("执行完成：已按计划写回正文或插入中继节点。")
+    } catch (err) {
+      setPlanActionMessage(err instanceof Error ? err.message : String(err))
+    } finally {
+      setExecutingPlan(false)
+    }
+  }
+  const handleUndoExecutionStep = async (step: GalLonglinePlanExecutionStep) => {
+    if (!wikiProject?.path || !galStore.project || step.status !== "succeeded" || undoneStepIds.has(step.stepId)) return
+    const snapshot = undoSnapshotsRef.current[step.stepId]
+    if (!snapshot) {
+      setPlanActionMessage("未找到本步骤的撤回快照，无法撤回。")
       return
     }
-    const confirmed = window.confirm(`将写回 ${selected.length} 个目标节点正文。边界节点不会被修改。是否继续？`)
-    if (!confirmed) return
-
-    setApplying(true)
-    setApplyError(null)
-    setApplyMessage(null)
     try {
-      const latestProject = await loadGalProject(wikiProject.path)
-      if (!latestProject) throw new Error("未找到 Gal 项目")
-      const snapshots: Record<string, AppliedSnapshot> = {}
-      const now = new Date().toISOString()
-
-      for (const item of selected) {
-        const node = findProjectNode(latestProject.routes, item.nodeId)
-        if (!node || !targetIds.has(node.id)) continue
-        snapshots[node.id] = {
-          routeId: node.routeId,
-          nodeId: node.id,
-          oldScript: scripts[node.id] ?? "",
-          oldStatus: node.status,
-          oldUpdatedAt: node.updatedAt,
+      if (step.type === "rewrite_node") {
+        const rewriteSnapshot = snapshot as RewriteUndoSnapshot
+        await undoRewriteStep(wikiProject.path, galStore.project, rewriteSnapshot)
+        setScripts((prev) => ({ ...prev, [rewriteSnapshot.nodeId]: rewriteSnapshot.oldScript }))
+        locateLonglineNode(rewriteSnapshot.nodeId, setActiveNodeId, galStore)
+      } else if (step.type === "insert_bridge_node") {
+        const insertSnapshot = {
+          ...(snapshot as InsertUndoSnapshot),
+          insertedNodeId: step.insertedNodeId ?? (snapshot as InsertUndoSnapshot).insertedNodeId,
         }
-        await saveNodeScript(wikiProject.path, node.routeId, node.id, item.optimizedScript)
-        node.status = "draft"
-        node.updatedAt = now
+        await undoInsertStep(wikiProject.path, galStore.project, insertSnapshot)
+        if (insertSnapshot.insertedNodeId) {
+          setScripts((prev) => {
+            const next = { ...prev }
+            delete next[insertSnapshot.insertedNodeId!]
+            return next
+          })
+        }
+        locateLonglineNode(insertSnapshot.afterNodeId, setActiveNodeId, galStore)
       }
-
-      latestProject.updatedAt = now
-      await saveGalProject(wikiProject.path, latestProject)
-      const refreshed = await loadGalProject(wikiProject.path)
-      galStore.setProject(refreshed)
-      setScripts((prev) => ({
+      galStore.setProject({ ...galStore.project })
+      setUndoneStepIds((prev) => new Set([...prev, step.stepId]))
+      setExecutionReport((prev) => prev ? {
         ...prev,
-        ...Object.fromEntries(selected.map((item) => [item.nodeId, item.optimizedScript])),
-      }))
-      setAppliedSnapshots((prev) => ({ ...prev, ...snapshots }))
-      setApplyMessage(`已应用 ${Object.keys(snapshots).length} 个节点优化。`)
+        steps: prev.steps.map((item) => item.stepId === step.stepId ? { ...item, written: false, message: `${item.message}（已撤回）` } : item),
+      } : prev)
+      setPlanActionMessage("已撤回所选步骤。")
     } catch (err) {
-      setApplyError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setApplying(false)
+      setPlanActionMessage(err instanceof Error ? err.message : String(err))
     }
   }
-  const applySuggestedInsertion = async (suggestion: GalLonglineSuggestedNodeInsertion) => {
-    if (!wikiProject?.path || !range) return
-    const targetPairs = new Set(range.targetNodes.slice(0, -1).map((node, index) => `${node.id}->${range.targetNodes[index + 1].id}`))
-    if (!targetPairs.has(`${suggestion.afterNodeId}->${suggestion.beforeNodeId}`)) {
-      setApplyError("只能在目标长线节点内部插入过渡节点。")
-      return
-    }
-    const confirmed = window.confirm(`将在「${suggestion.afterNodeId}」和「${suggestion.beforeNodeId}」之间插入过渡节点「${suggestion.title}」。是否继续？`)
-    if (!confirmed) return
-
-    setApplying(true)
-    setApplyError(null)
-    setApplyMessage(null)
-    try {
-      const latestProject = await loadGalProject(wikiProject.path)
-      if (!latestProject) throw new Error("未找到 Gal 项目")
-      const afterNode = findProjectNode(latestProject.routes, suggestion.afterNodeId)
-      const beforeNode = findProjectNode(latestProject.routes, suggestion.beforeNodeId)
-      if (!afterNode || !beforeNode) throw new Error("未找到插入位置的前后节点")
-      if (afterNode.routeId !== beforeNode.routeId) throw new Error("插入失败：前后节点不在同一真实线路中")
-      const latestAfterTargets = getNodeLinkedTargetIds(afterNode)
-      if (latestAfterTargets.length !== 1 || latestAfterTargets[0] !== beforeNode.id || beforeNode.parents.length !== 1 || beforeNode.parents[0] !== afterNode.id) {
-        throw new Error("插入失败：前后节点当前不是单线直连关系")
-      }
-      const routeToSave = latestProject.routes.find((item) => item.id === afterNode.routeId)
-      if (!routeToSave) throw new Error("未找到要写入的线路")
-
-      const now = new Date().toISOString()
-      const newNodeId = createInsertionNodeId(routeToSave, suggestion.title)
-      const insertionSnapshot: AppliedInsertionSnapshot = {
-        suggestionId: suggestion.id,
-        routeId: routeToSave.id,
-        newNodeId,
-        afterNodeId: afterNode.id,
-        beforeNodeId: beforeNode.id,
-        afterChildren: [...(afterNode.children ?? [])],
-        afterChoices: cloneChoices(afterNode.choices ?? []),
-        afterUpdatedAt: afterNode.updatedAt,
-        beforeParents: [...(beforeNode.parents ?? [])],
-        beforeUpdatedAt: beforeNode.updatedAt,
-        routeSequences: routeToSave.nodes.map((node) => ({
-          nodeId: node.id,
-          sequence: node.sequence ?? 0,
-        })),
-        routeNodeIds: Object.fromEntries(
-          latestProject.routes
-            .filter((item) => hasAdjacentNodeIds(item.nodeIds, afterNode.id, beforeNode.id))
-            .map((item) => [item.id, [...item.nodeIds!]]),
-        ),
-      }
-      const newSequence = afterNode.sequence + 1
-      for (const node of routeToSave.nodes) {
-        if ((node.sequence ?? 0) >= newSequence) node.sequence = (node.sequence ?? 0) + 1
-      }
-      const newChoice: GalChoice = {
-        id: `choice_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-        text: "继续",
-        emotionalIntent: "推进连续剧情",
-        effects: [],
-        nextNodeId: beforeNode.id,
-        nextNodeTitle: beforeNode.title,
-        nextNodeGoal: beforeNode.goal,
-      }
-      const newNode: GalNode = {
-        id: newNodeId,
-        routeId: routeToSave.id,
-        title: suggestion.title,
-        type: "daily",
-        status: "draft",
-        parents: [afterNode.id],
-        children: [beforeNode.id],
-        goal: suggestion.goal,
-        summary: suggestion.summary,
-        boardPosition: midpointPosition(afterNode, beforeNode),
-        scriptPath: `nodes/${routeToSave.id}/${newNodeId}.md`,
-        incomingState: cloneStateSnapshot(beforeNode.incomingState),
-        choices: [newChoice],
-        memoryScope: "node",
-        characters: Array.from(new Set([...(afterNode.characters ?? []), ...(beforeNode.characters ?? [])])),
-        scene: beforeNode.scene || afterNode.scene,
-        clueIds: [],
-        sequence: newSequence,
-        createdAt: now,
-        updatedAt: now,
-      }
-
-      for (const choice of afterNode.choices ?? []) {
-        if (choice.nextNodeId === beforeNode.id) {
-          choice.nextNodeId = newNode.id
-          choice.nextNodeTitle = newNode.title
-          choice.nextNodeGoal = newNode.goal
-        }
-      }
-      afterNode.children = afterNode.children.map((childId) => childId === beforeNode.id ? newNode.id : childId)
-      beforeNode.parents = beforeNode.parents.map((parentId) => parentId === afterNode.id ? newNode.id : parentId)
-      afterNode.updatedAt = now
-      beforeNode.updatedAt = now
-      routeToSave.nodes.push(newNode)
-
-      for (const pathRoute of latestProject.routes) {
-        if (!Array.isArray(pathRoute.nodeIds)) continue
-        const nextNodeIds: string[] = []
-        for (let index = 0; index < pathRoute.nodeIds.length; index += 1) {
-          const nodeId = pathRoute.nodeIds[index]
-          nextNodeIds.push(nodeId)
-          if (nodeId === afterNode.id && pathRoute.nodeIds[index + 1] === beforeNode.id) {
-            nextNodeIds.push(newNode.id)
-          }
-        }
-        pathRoute.nodeIds = nextNodeIds
-      }
-
-      latestProject.updatedAt = now
-      await saveNodeScript(wikiProject.path, routeToSave.id, newNode.id, suggestion.script)
-      await saveGalProject(wikiProject.path, latestProject)
-      const refreshed = await loadGalProject(wikiProject.path)
-      galStore.setProject(refreshed)
-      galStore.selectNode(newNode.id)
-      setScripts((prev) => ({ ...prev, [newNode.id]: suggestion.script }))
-      setAppliedInsertionIds((prev) => Array.from(new Set([...prev, suggestion.id])))
-      setAppliedInsertionSnapshots((prev) => ({ ...prev, [suggestion.id]: insertionSnapshot }))
-      setActiveNodeId(newNode.id)
-      setApplyMessage(`已插入过渡节点「${newNode.title}」。`)
-    } catch (err) {
-      setApplyError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setApplying(false)
-    }
-  }
-  const undoAppliedInsertion = async (suggestionId: string) => {
-    if (!wikiProject?.path) return
-    const snapshot = appliedInsertionSnapshots[suggestionId]
-    if (!snapshot) return
-    const confirmed = window.confirm("将删除本次新增的过渡节点，并恢复插入前的前后节点连接。是否继续？")
-    if (!confirmed) return
-
-    setApplying(true)
-    setApplyError(null)
-    setApplyMessage(null)
-    try {
-      const latestProject = await loadGalProject(wikiProject.path)
-      if (!latestProject) throw new Error("未找到 Gal 项目")
-      const routeToSave = latestProject.routes.find((item) => item.id === snapshot.routeId)
-      if (!routeToSave) throw new Error("未找到要撤回的线路")
-      const newNode = routeToSave.nodes.find((node) => node.id === snapshot.newNodeId)
-      const afterNode = routeToSave.nodes.find((node) => node.id === snapshot.afterNodeId)
-      const beforeNode = routeToSave.nodes.find((node) => node.id === snapshot.beforeNodeId)
-      if (!newNode || !afterNode || !beforeNode) {
-        throw new Error("撤回失败：新增节点或前后节点已不存在")
-      }
-      if (
-        newNode.parents.length !== 1
-        || newNode.parents[0] !== afterNode.id
-        || newNode.children.length !== 1
-        || newNode.children[0] !== beforeNode.id
-      ) {
-        throw new Error("撤回失败：新增节点连接已被后续操作修改，请先处理后续改动")
-      }
-
-      afterNode.children = [...snapshot.afterChildren]
-      afterNode.choices = cloneChoices(snapshot.afterChoices)
-      afterNode.updatedAt = snapshot.afterUpdatedAt
-      beforeNode.parents = [...snapshot.beforeParents]
-      beforeNode.updatedAt = snapshot.beforeUpdatedAt
-
-      const sequenceByNodeId = new Map(snapshot.routeSequences.map((item) => [item.nodeId, item.sequence]))
-      routeToSave.nodes = routeToSave.nodes
-        .filter((node) => node.id !== snapshot.newNodeId)
-        .map((node) => ({
-          ...node,
-          sequence: sequenceByNodeId.get(node.id) ?? node.sequence,
-        }))
-      for (const pathRoute of latestProject.routes) {
-        const oldNodeIds = snapshot.routeNodeIds[pathRoute.id]
-        if (oldNodeIds) pathRoute.nodeIds = [...oldNodeIds]
-      }
-
-      latestProject.updatedAt = new Date().toISOString()
-      await deleteNodeScript(wikiProject.path, snapshot.routeId, snapshot.newNodeId)
-      await saveGalProject(wikiProject.path, latestProject)
-      const refreshed = await loadGalProject(wikiProject.path)
-      galStore.setProject(refreshed)
-      galStore.selectNode(snapshot.afterNodeId)
-      setScripts((prev) => {
-        const next = { ...prev }
-        delete next[snapshot.newNodeId]
-        return next
-      })
-      setAppliedInsertionIds((prev) => prev.filter((id) => id !== suggestionId))
-      setAppliedInsertionSnapshots((prev) => {
-        const next = { ...prev }
-        delete next[suggestionId]
-        return next
-      })
-      setActiveNodeId(snapshot.afterNodeId)
-      setApplyMessage("已撤回新增过渡节点，并恢复原连接。")
-    } catch (err) {
-      setApplyError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setApplying(false)
-    }
-  }
-  const undoAppliedOptimization = async (nodeId: string) => {
-    if (!wikiProject?.path) return
-    const snapshot = appliedSnapshots[nodeId]
-    if (!snapshot) return
-    const confirmed = window.confirm("将撤回本页面内保存的优化正文，恢复应用前正文。是否继续？")
-    if (!confirmed) return
-
-    setApplying(true)
-    setApplyError(null)
-    setApplyMessage(null)
-    try {
-      const latestProject = await loadGalProject(wikiProject.path)
-      if (!latestProject) throw new Error("未找到 Gal 项目")
-      const node = findProjectNode(latestProject.routes, snapshot.nodeId)
-      if (!node) throw new Error("未找到要撤回的节点")
-      await saveNodeScript(wikiProject.path, snapshot.routeId, snapshot.nodeId, snapshot.oldScript)
-      node.status = snapshot.oldStatus
-      node.updatedAt = snapshot.oldUpdatedAt
-      latestProject.updatedAt = new Date().toISOString()
-      await saveGalProject(wikiProject.path, latestProject)
-      galStore.setProject(await loadGalProject(wikiProject.path))
-      setScripts((prev) => ({ ...prev, [snapshot.nodeId]: snapshot.oldScript }))
-      setAppliedSnapshots((prev) => {
-        const next = { ...prev }
-        delete next[snapshot.nodeId]
-        return next
-      })
-      setApplyMessage("已撤回该节点优化。")
-    } catch (err) {
-      setApplyError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setApplying(false)
-    }
+  const handleViewExecutionStep = (step: GalLonglinePlanExecutionStep) => {
+    if (step.nodeId) locateLonglineNode(step.nodeId, setActiveNodeId, galStore)
+    setCompareStepId((current) => current === step.stepId ? null : step.stepId)
   }
 
   if (!route || !range) {
@@ -620,15 +444,6 @@ export function GalLonglineWorkspace({
                   {activeScript.trim() || "该节点正文为空。"}
                 </pre>
               </div>
-              {activeOptimization && (
-                <OptimizationCompare
-                  item={activeOptimization}
-                  decision={optimizationDecisions[activeOptimization.nodeId] ?? "pending"}
-                  applied={Boolean(appliedSnapshots[activeOptimization.nodeId])}
-                  onDecisionChange={(decision) => setOptimizationDecision(activeOptimization.nodeId, decision)}
-                  onUndo={() => undoAppliedOptimization(activeOptimization.nodeId)}
-                />
-              )}
             </div>
           ) : (
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -659,7 +474,7 @@ export function GalLonglineWorkspace({
           <div className="rounded-md border bg-card p-3">
             <div className="mb-2 text-xs font-medium">提示</div>
             <div className="text-xs leading-5 text-muted-foreground">
-              当前页面会先生成优化预览；只有点击应用按钮后，才会写回目标节点正文。
+              当前页面会先生成优化计划；计划不会写回项目，后续执行阶段才会按步骤处理。
             </div>
           </div>
           <ReviewPanel
@@ -670,21 +485,18 @@ export function GalLonglineWorkspace({
           <OptimizationPanel
             plan={optimizationPlan}
             error={optimizationError}
-            decisions={optimizationDecisions}
-            appliedNodeIds={new Set(Object.keys(appliedSnapshots))}
-            applying={applying}
-            message={applyMessage}
-            applyError={applyError}
+            selectedStepIds={selectedPlanStepIds}
+            message={planActionMessage}
+            executionReport={executionReport}
+            executing={executingPlan}
+            undoneStepIds={undoneStepIds}
+            undoSnapshots={undoSnapshots}
+            compareStepId={compareStepId}
             onSelectNode={(nodeId) => locateLonglineNode(nodeId, setActiveNodeId, galStore)}
-            onDecisionChange={setOptimizationDecision}
-            onApplySelected={() => applyOptimizations("selected")}
-            onApplyAll={() => applyOptimizations("all")}
-            onUndo={undoAppliedOptimization}
-            onApplyInsertion={applySuggestedInsertion}
-            onUndoInsertion={undoAppliedInsertion}
-            onDiscardInsertion={(id) => setDiscardedInsertionIds((prev) => Array.from(new Set([...prev, id])))}
-            discardedInsertionIds={new Set(discardedInsertionIds)}
-            appliedInsertionIds={new Set(appliedInsertionIds)}
+            onStepSelectedChange={setPlanStepSelected}
+            onExecuteSelected={handleExecuteSelectedPlan}
+            onViewExecutionStep={handleViewExecutionStep}
+            onUndoExecutionStep={handleUndoExecutionStep}
           />
         </aside>
       </div>
@@ -761,29 +573,19 @@ function buildRangeSummary(targetCount: number, upstream: GalNode | null, downst
   return `上游边界：${upstream?.title || "无"}；目标节点：${targetCount} 个；下游边界：${downstream?.title || "无"}`
 }
 
-function findProjectNode(routes: GalRoute[], nodeId: string): GalNode | null {
-  for (const route of routes) {
-    const node = route.nodes.find((item) => item.id === nodeId)
-    if (node) return node
+function mergeExecutionStep(
+  report: GalLonglinePlanExecutionReport | null,
+  step: GalLonglinePlanExecutionStep,
+  index: number,
+): GalLonglinePlanExecutionReport {
+  const now = new Date().toISOString()
+  const steps = [...(report?.steps ?? [])]
+  steps[index] = step
+  return {
+    startedAt: report?.startedAt ?? now,
+    finishedAt: report?.finishedAt ?? now,
+    steps,
   }
-  return null
-}
-
-function cloneChoices(choices: GalChoice[]): GalChoice[] {
-  return choices.map((choice) => ({
-    ...choice,
-    condition: choice.condition ? [...choice.condition] : undefined,
-    effects: (choice.effects ?? []).map((effect) => ({ ...effect })),
-  }))
-}
-
-function hasAdjacentNodeIds(
-  nodeIds: string[] | undefined,
-  afterNodeId: string,
-  beforeNodeId: string,
-): nodeIds is string[] {
-  if (!Array.isArray(nodeIds)) return false
-  return nodeIds.some((nodeId, index) => nodeId === afterNodeId && nodeIds[index + 1] === beforeNodeId)
 }
 
 function locateLonglineNode(
@@ -796,12 +598,107 @@ function locateLonglineNode(
   galStore.requestLocateNode(nodeId)
 }
 
+function createUndoSnapshot(
+  step: GalLonglineOptimizationPlan["steps"][number],
+  project: GalProject,
+  scripts: Record<string, string>,
+): StepUndoSnapshot | null {
+  if (step.type === "rewrite_node" && step.targetNodeId) {
+    const node = findProjectNode(project, step.targetNodeId)
+    if (!node) return null
+    return {
+      routeId: node.routeId,
+      nodeId: node.id,
+      oldScript: scripts[node.id] ?? "",
+      oldStatus: node.status,
+      oldUpdatedAt: node.updatedAt,
+    }
+  }
+  if (step.type === "insert_bridge_node" && step.afterNodeId && step.beforeNodeId) {
+    const route = project.routes.find((item) => item.nodes.some((node) => node.id === step.afterNodeId))
+    const afterNode = route?.nodes.find((node) => node.id === step.afterNodeId)
+    const beforeNode = route?.nodes.find((node) => node.id === step.beforeNodeId)
+    if (!route || !afterNode || !beforeNode) return null
+    return {
+      routeId: route.id,
+      afterNodeId: afterNode.id,
+      beforeNodeId: beforeNode.id,
+      afterChildren: [...afterNode.children],
+      afterChoices: cloneChoices(afterNode.choices),
+      afterUpdatedAt: afterNode.updatedAt,
+      beforeParents: [...beforeNode.parents],
+      beforeUpdatedAt: beforeNode.updatedAt,
+      routeNodeIds: Object.fromEntries(
+        project.routes
+          .filter((item) => Array.isArray(item.nodeIds))
+          .map((item) => [item.id, [...item.nodeIds!]]),
+      ),
+      routeSequences: route.nodes.map((node) => ({ nodeId: node.id, sequence: node.sequence })),
+    }
+  }
+  return null
+}
+
+async function undoRewriteStep(projectPath: string, project: GalProject, snapshot: RewriteUndoSnapshot): Promise<void> {
+  const node = findProjectNode(project, snapshot.nodeId)
+  if (!node) throw new Error("撤回失败：目标节点不存在")
+  await saveNodeScript(projectPath, snapshot.routeId, snapshot.nodeId, snapshot.oldScript)
+  node.status = snapshot.oldStatus
+  node.updatedAt = snapshot.oldUpdatedAt
+  project.updatedAt = new Date().toISOString()
+  await saveGalProject(projectPath, project)
+}
+
+async function undoInsertStep(projectPath: string, project: GalProject, snapshot: InsertUndoSnapshot): Promise<void> {
+  const route = project.routes.find((item) => item.id === snapshot.routeId)
+  const afterNode = route?.nodes.find((node) => node.id === snapshot.afterNodeId)
+  const beforeNode = route?.nodes.find((node) => node.id === snapshot.beforeNodeId)
+  if (!route || !afterNode || !beforeNode || !snapshot.insertedNodeId) {
+    throw new Error("撤回失败：插入节点或前后节点不存在")
+  }
+  const inserted = route.nodes.find((node) => node.id === snapshot.insertedNodeId)
+  if (!inserted) throw new Error("撤回失败：插入节点已不存在")
+  if (inserted.parents[0] !== afterNode.id || inserted.children[0] !== beforeNode.id) {
+    throw new Error("撤回失败：插入节点连接已被后续操作修改")
+  }
+  afterNode.children = [...snapshot.afterChildren]
+  afterNode.choices = cloneChoices(snapshot.afterChoices)
+  afterNode.updatedAt = snapshot.afterUpdatedAt
+  beforeNode.parents = [...snapshot.beforeParents]
+  beforeNode.updatedAt = snapshot.beforeUpdatedAt
+  const sequenceByNodeId = new Map(snapshot.routeSequences.map((item) => [item.nodeId, item.sequence]))
+  route.nodes = route.nodes
+    .filter((node) => node.id !== snapshot.insertedNodeId)
+    .map((node) => ({ ...node, sequence: sequenceByNodeId.get(node.id) ?? node.sequence }))
+  for (const item of project.routes) {
+    const nodeIds = snapshot.routeNodeIds[item.id]
+    if (nodeIds) item.nodeIds = [...nodeIds]
+  }
+  project.updatedAt = new Date().toISOString()
+  await deleteNodeScript(projectPath, snapshot.routeId, snapshot.insertedNodeId)
+  await saveGalProject(projectPath, project)
+}
+
+function findProjectNode(project: GalProject, nodeId: string): GalNode | null {
+  for (const route of project.routes) {
+    const node = route.nodes.find((item) => item.id === nodeId)
+    if (node) return node
+  }
+  return null
+}
+
+function cloneChoices(choices: GalNode["choices"]): GalNode["choices"] {
+  return choices.map((choice) => ({
+    ...choice,
+    condition: choice.condition ? choice.condition.map((item) => ({ ...item })) : undefined,
+    effects: choice.effects.map((item) => ({ ...item })),
+  }))
+}
+
 function buildLonglineBoardHighlight(
   range: GalLonglineRange,
   reviewReport: GalLonglineReviewReport | null,
   optimizationPlan: GalLonglineOptimizationPlan | null,
-  discardedInsertionIds: Set<string>,
-  appliedInsertionIds: Set<string>,
 ): GalBoardHighlightState {
   const nodes: GalBoardHighlightState["nodes"] = {}
   if (range.upstreamBoundary) {
@@ -831,50 +728,15 @@ function buildLonglineBoardHighlight(
   }
   return {
     nodes,
-    previewInsertions: (optimizationPlan?.suggestedInsertions ?? [])
-      .filter((item) => !discardedInsertionIds.has(item.id) && !appliedInsertionIds.has(item.id))
+    previewInsertions: (optimizationPlan?.steps ?? [])
+      .filter((item) => item.type === "insert_bridge_node" && item.afterNodeId && item.beforeNodeId)
       .map((item) => ({
         id: item.id,
-        afterNodeId: item.afterNodeId,
-        beforeNodeId: item.beforeNodeId,
+        afterNodeId: item.afterNodeId!,
+        beforeNodeId: item.beforeNodeId!,
         title: item.title,
       })),
   }
-}
-
-function createInsertionNodeId(route: GalRoute, title: string): string {
-  const slug = title
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 24) || "transition"
-  let id = `node_${slug}_${Date.now().toString(36)}`
-  while (route.nodes.some((node) => node.id === id)) {
-    id = `node_${slug}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
-  }
-  return id
-}
-
-function cloneStateSnapshot(snapshot: GalStateSnapshot): GalStateSnapshot {
-  return JSON.parse(JSON.stringify(snapshot)) as GalStateSnapshot
-}
-
-function midpointPosition(afterNode: GalNode, beforeNode: GalNode): GalNode["boardPosition"] {
-  if (!afterNode.boardPosition && !beforeNode.boardPosition) return undefined
-  return {
-    x: Math.round(((afterNode.boardPosition?.x ?? 0) + (beforeNode.boardPosition?.x ?? afterNode.boardPosition?.x ?? 0)) / 2),
-    y: Math.round(((afterNode.boardPosition?.y ?? 0) + (beforeNode.boardPosition?.y ?? afterNode.boardPosition?.y ?? 0)) / 2),
-  }
-}
-
-function getNodeLinkedTargetIds(node: GalNode): string[] {
-  return Array.from(new Set([
-    ...(node.children ?? []),
-    ...(node.choices ?? [])
-      .map((choice) => choice.nextNodeId)
-      .filter((targetId): targetId is string => Boolean(targetId)),
-  ]))
 }
 
 function roleLabel(role: ChainItem["role"]): string {
@@ -949,215 +811,167 @@ function ReviewPanel({
   )
 }
 
-function OptimizationCompare({
-  item,
-  decision,
-  applied,
-  onDecisionChange,
-  onUndo,
-}: {
-  item: GalLonglineNodeOptimization
-  decision: OptimizationDecision
-  applied: boolean
-  onDecisionChange: (decision: OptimizationDecision) => void
-  onUndo: () => void
-}) {
-  return (
-    <div className="mt-3 rounded-md border bg-card">
-      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-xs">
-        <div className="min-w-0 flex-1 font-medium">优化预览：{item.title}</div>
-        <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">{suggestionLabel(item.suggestion)}</span>
-        {applied && <span className="rounded bg-emerald-500/10 px-2 py-0.5 text-emerald-400">已应用</span>}
-        <DecisionButtons decision={decision} onChange={onDecisionChange} />
-        {applied && (
-          <button type="button" onClick={onUndo} className="rounded border px-2 py-1 text-[11px] hover:bg-accent">
-            撤回本页应用
-          </button>
-        )}
-      </div>
-      <div className="border-b px-3 py-2 text-xs leading-5 text-muted-foreground">
-        修改原因：{item.reason || "AI 未说明修改原因。"}
-      </div>
-      <div className="grid min-h-[360px] grid-cols-2 divide-x">
-        <div className="min-w-0">
-          <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">原正文</div>
-          <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap p-4 text-sm leading-7">
-            {item.originalScript.trim() || "该节点原正文为空。"}
-          </pre>
-        </div>
-        <div className="min-w-0">
-          <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">AI 优化正文</div>
-          <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap p-4 text-sm leading-7">
-            {item.optimizedScript.trim() || "AI 未返回优化正文。"}
-          </pre>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function OptimizationPanel({
   plan,
   error,
-  decisions,
-  appliedNodeIds,
-  applying,
+  selectedStepIds,
   message,
-  applyError,
+  executionReport,
+  executing,
+  undoneStepIds,
+  undoSnapshots,
+  compareStepId,
   onSelectNode,
-  onDecisionChange,
-  onApplySelected,
-  onApplyAll,
-  onUndo,
-  onApplyInsertion,
-  onUndoInsertion,
-  onDiscardInsertion,
-  discardedInsertionIds,
-  appliedInsertionIds,
+  onStepSelectedChange,
+  onExecuteSelected,
+  onViewExecutionStep,
+  onUndoExecutionStep,
 }: {
   plan: GalLonglineOptimizationPlan | null
   error: string | null
-  decisions: Record<string, OptimizationDecision>
-  appliedNodeIds: Set<string>
-  applying: boolean
+  selectedStepIds: Set<string>
   message: string | null
-  applyError: string | null
+  executionReport: GalLonglinePlanExecutionReport | null
+  executing: boolean
+  undoneStepIds: Set<string>
+  undoSnapshots: Record<string, StepUndoSnapshot>
+  compareStepId: string | null
   onSelectNode: (nodeId: string) => void
-  onDecisionChange: (nodeId: string, decision: OptimizationDecision) => void
-  onApplySelected: () => void
-  onApplyAll: () => void
-  onUndo: (nodeId: string) => void
-  onApplyInsertion: (suggestion: GalLonglineSuggestedNodeInsertion) => void
-  onUndoInsertion: (suggestionId: string) => void
-  onDiscardInsertion: (id: string) => void
-  discardedInsertionIds: Set<string>
-  appliedInsertionIds: Set<string>
+  onStepSelectedChange: (stepId: string, selected: boolean) => void
+  onExecuteSelected: () => void
+  onViewExecutionStep: (step: GalLonglinePlanExecutionStep) => void
+  onUndoExecutionStep: (step: GalLonglinePlanExecutionStep) => void
 }) {
-  const acceptedCount = plan?.nodeOptimizations.filter((item) => decisions[item.nodeId] === "accept").length ?? 0
-  const visibleInsertions = plan?.suggestedInsertions.filter((item) => !discardedInsertionIds.has(item.id)) ?? []
+  const selectedExecutableCount = plan?.steps.filter((step) => isExecutablePlanStep(step) && selectedStepIds.has(step.id)).length ?? 0
   return (
     <div className="mt-3 rounded-md border bg-card p-3">
       <div className="mb-2 flex items-center gap-1.5 text-xs font-medium">
         <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
-        优化方案预览
+        优化计划
       </div>
       {error && (
         <div className="mb-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-xs leading-5 text-destructive">
           {error}
         </div>
       )}
-      {applyError && (
-        <div className="mb-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-xs leading-5 text-destructive">
-          {applyError}
-        </div>
-      )}
       {message && (
-        <div className="mb-2 rounded border border-emerald-500/30 bg-emerald-500/10 p-2 text-xs leading-5 text-emerald-400">
+        <div className="mb-2 rounded border border-blue-500/30 bg-blue-500/10 p-2 text-xs leading-5 text-blue-300">
           {message}
         </div>
       )}
       {!plan ? (
         <div className="text-xs leading-5 text-muted-foreground">
-          点击顶部“生成优化方案”后，会在这里显示每个目标节点的优化预览。预览本身不会保存到磁盘。
+          点击顶部“生成优化方案”后，会在这里显示结构化执行计划。计划本身不会生成正文，也不会保存到磁盘。
         </div>
       ) : (
         <div className="space-y-3 text-xs">
-          <div className="flex flex-wrap gap-1">
-            <button type="button" disabled={applying || acceptedCount === 0} onClick={onApplySelected} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-              {applying ? "保存中..." : `应用选中修改 (${acceptedCount})`}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={executing || selectedExecutableCount === 0}
+              onClick={onExecuteSelected}
+              className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+            >
+              {executing ? "执行中..." : `执行选中计划（${selectedExecutableCount}）`}
             </button>
-            <button type="button" disabled={applying || plan.nodeOptimizations.length === 0} onClick={onApplyAll} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-              应用全部修改
-            </button>
+            <span className="text-[11px] text-muted-foreground">执行后会写回正文或插入中继节点，请只勾选确认要应用的步骤。</span>
           </div>
           <ReportSection title="整体说明">
             <p className="leading-5 text-muted-foreground">{plan.summary}</p>
           </ReportSection>
-          <ReportSection title={`节点优化 (${plan.nodeOptimizations.length})`}>
-            {plan.nodeOptimizations.length ? plan.nodeOptimizations.map((item) => (
-              <div key={item.nodeId} className="rounded border bg-muted/30 p-2">
-                <button
-                  type="button"
-                  onClick={() => onSelectNode(item.nodeId)}
-                  className="mb-1 block w-full truncate text-left font-medium hover:text-primary"
-                >
-                  {item.title || item.nodeId}
-                </button>
-                <div className="mb-2 line-clamp-3 leading-5 text-muted-foreground">{item.reason || "无修改原因"}</div>
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground">{suggestionLabel(item.suggestion)}</span>
-                  <span className={`text-[11px] ${appliedNodeIds.has(item.nodeId) ? "text-emerald-400" : "text-muted-foreground"}`}>
-                    {appliedNodeIds.has(item.nodeId) ? "已应用" : decisionLabel(decisions[item.nodeId] ?? "pending")}
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-1">
-                  <DecisionButtons
-                    decision={decisions[item.nodeId] ?? "pending"}
-                    onChange={(decision) => onDecisionChange(item.nodeId, decision)}
-                  />
-                  {appliedNodeIds.has(item.nodeId) && (
-                    <button type="button" disabled={applying} onClick={() => onUndo(item.nodeId)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-                      撤回
-                    </button>
-                  )}
-                </div>
-              </div>
-            )) : <EmptyReportText />}
-          </ReportSection>
-          <ReportSection title={`建议新增节点 (${visibleInsertions.length})`}>
-            {visibleInsertions.length ? visibleInsertions.map((item) => (
+          <ReportSection title={`计划步骤 (${plan.steps.length})`}>
+            {plan.steps.length ? plan.steps.map((item) => (
               <div key={item.id} className="rounded border bg-muted/30 p-2">
-                <div className="mb-1 font-medium">{item.afterNodeId} → {item.title} → {item.beforeNodeId}</div>
-                <div className="mb-1 text-muted-foreground">目标：{item.goal}</div>
-                <div className="mb-1 text-muted-foreground">摘要：{item.summary}</div>
-                <div className="mb-2 line-clamp-3 whitespace-pre-wrap text-muted-foreground">正文：{item.script}</div>
-                <div className="mb-2 text-muted-foreground">原因：{item.reason || "AI 未说明原因"}</div>
-                <div className="flex flex-wrap items-center gap-1">
-                  {appliedInsertionIds.has(item.id) ? (
-                    <>
-                      <span className="rounded bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-400">已插入</span>
-                      <button type="button" disabled={applying} onClick={() => onUndoInsertion(item.id)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-                        撤回新增
-                      </button>
-                    </>
-                  ) : (
-                    <button type="button" disabled={applying} onClick={() => onApplyInsertion(item)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-                      确认插入
-                    </button>
-                  )}
-                  {!appliedInsertionIds.has(item.id) && (
-                    <button type="button" disabled={applying} onClick={() => onDiscardInsertion(item.id)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
-                      丢弃
-                    </button>
-                  )}
+                <div className="mb-1 flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedStepIds.has(item.id)}
+                    disabled={!isExecutablePlanStep(item)}
+                    onChange={(event) => onStepSelectedChange(item.id, event.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5"
+                    aria-label={`选择计划步骤：${item.title}`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => item.targetNodeId ? onSelectNode(item.targetNodeId) : undefined}
+                    disabled={!item.targetNodeId}
+                    className="block min-w-0 flex-1 truncate text-left font-medium hover:text-primary disabled:hover:text-inherit"
+                  >
+                    {stepTypeLabel(item.type)}：{item.title}
+                  </button>
                 </div>
+                <div className="mb-2 flex flex-wrap gap-1 text-[11px] text-muted-foreground">
+                  {item.targetNodeId && <span className="rounded bg-background px-2 py-0.5">目标：{item.targetNodeId}</span>}
+                  {item.afterNodeId && item.beforeNodeId && <span className="rounded bg-background px-2 py-0.5">插入：{item.afterNodeId} → {item.beforeNodeId}</span>}
+                  <span className="rounded bg-background px-2 py-0.5">优先级：{priorityLabel(item.priority)}</span>
+                  <span className="rounded bg-background px-2 py-0.5">风险：{riskLabel(item.risk)}</span>
+                </div>
+                <div className="mb-1 leading-5 text-muted-foreground">原因：{item.reason}</div>
+                <div className="mb-1 leading-5 text-muted-foreground">目标：{item.intent}</div>
+                <div className="mb-1 leading-5 text-muted-foreground">范围：{item.scope}</div>
+                {item.constraints.length > 0 && (
+                  <div className="leading-5 text-muted-foreground">
+                    约束：{item.constraints.join("；")}
+                  </div>
+                )}
               </div>
             )) : <EmptyReportText />}
           </ReportSection>
+          {executionReport && (
+            <ReportSection title={`执行报告 (${executionReport.steps.length})`}>
+              {executionReport.steps.length ? executionReport.steps.map((item, index) => (
+                <div key={`${item.stepId}-${index}`} className="rounded border bg-muted/30 p-2">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate font-medium">{index + 1}. {item.title}</span>
+                    <span className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground">
+                      {executionStatusLabel(item.status)}
+                    </span>
+                  </div>
+                  <div className="leading-5 text-muted-foreground">{item.message}</div>
+                  <div className="mt-1 flex flex-wrap gap-1 text-[11px] text-muted-foreground">
+                    {item.nodeTitle && <span className="rounded bg-background px-2 py-0.5">节点：{item.nodeTitle}</span>}
+                    {item.insertedNodeTitle && <span className="rounded bg-background px-2 py-0.5">插入：{item.insertedNodeTitle}</span>}
+                    <span className={`rounded bg-background px-2 py-0.5 ${item.written === false ? "text-amber-300" : item.written ? "text-emerald-400" : ""}`}>
+                      {item.written === false ? "已撤回" : item.written ? "已写回" : "未写回"}
+                    </span>
+                  </div>
+                  {item.error && <div className="mt-1 leading-5 text-destructive">{item.error}</div>}
+                  {compareStepId === item.stepId && item.type === "rewrite_node" && (
+                    <ExecutionCompare
+                      oldScript={(undoSnapshots[item.stepId] as RewriteUndoSnapshot | undefined)?.oldScript ?? ""}
+                      newScript={item.updatedScript ?? ""}
+                    />
+                  )}
+                  {item.status === "succeeded" && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {item.type === "rewrite_node" && (
+                        <>
+                          <button type="button" onClick={() => onViewExecutionStep(item)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent">
+                            查看对比
+                          </button>
+                          <button type="button" disabled={undoneStepIds.has(item.stepId)} onClick={() => onUndoExecutionStep(item)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
+                            撤回本步
+                          </button>
+                        </>
+                      )}
+                      {item.type === "insert_bridge_node" && (
+                        <>
+                          <button type="button" onClick={() => onViewExecutionStep(item)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent">
+                            定位新节点
+                          </button>
+                          <button type="button" disabled={undoneStepIds.has(item.stepId)} onClick={() => onUndoExecutionStep(item)} className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50">
+                            撤回插入
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )) : <EmptyReportText />}
+            </ReportSection>
+          )}
         </div>
       )}
-    </div>
-  )
-}
-
-function DecisionButtons({
-  decision,
-  onChange,
-}: {
-  decision: OptimizationDecision
-  onChange: (decision: OptimizationDecision) => void
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-1">
-      <button type="button" onClick={() => onChange("accept")} className={decisionButtonClass(decision === "accept")}>
-        采用优化
-      </button>
-      <button type="button" onClick={() => onChange("keep")} className={decisionButtonClass(decision === "keep")}>
-        保留原文
-      </button>
-      <button type="button" onClick={() => onChange("regenerate")} className={decisionButtonClass(decision === "regenerate")}>
-        重新生成
-      </button>
     </div>
   )
 }
@@ -1203,23 +1017,63 @@ function ReportItem({
   )
 }
 
+function ExecutionCompare({ oldScript, newScript }: { oldScript: string; newScript: string }) {
+  return (
+    <div className="mt-2 grid gap-2 rounded border bg-background/60 p-2 md:grid-cols-2">
+      <div className="min-w-0">
+        <div className="mb-1 text-[11px] font-medium text-muted-foreground">原正文</div>
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-2 text-[11px] leading-5">
+          {oldScript.trim() || "原正文为空。"}
+        </pre>
+      </div>
+      <div className="min-w-0">
+        <div className="mb-1 text-[11px] font-medium text-muted-foreground">AI 正文</div>
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-2 text-[11px] leading-5">
+          {newScript.trim() || "AI 正文为空。"}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
 function EmptyReportText() {
   return <div className="text-muted-foreground">无</div>
 }
 
-function decisionButtonClass(active: boolean): string {
-  return `rounded border px-2 py-1 text-[11px] hover:bg-accent ${active ? "border-primary/50 bg-primary/10 text-primary" : ""}`
+function stepTypeLabel(type: GalLonglineOptimizationPlan["steps"][number]["type"]): string {
+  if (type === "rewrite_node") return "改写节点"
+  if (type === "insert_bridge_node") return "插入中继节点"
+  return "跳过"
 }
 
-function decisionLabel(decision: OptimizationDecision): string {
-  if (decision === "accept") return "已选择采用优化"
-  if (decision === "keep") return "已选择保留原文"
-  if (decision === "regenerate") return "已标记重新生成"
-  return "待选择"
+function isExecutablePlanStep(step: GalLonglineOptimizationPlan["steps"][number]): boolean {
+  if (step.type === "skip") return false
+  if (step.type === "rewrite_node") return Boolean(step.targetNodeId)
+  return Boolean(step.afterNodeId && step.beforeNodeId)
 }
 
-function suggestionLabel(suggestion: GalLonglineNodeOptimization["suggestion"]): string {
-  if (suggestion === "keep") return "建议保留"
-  if (suggestion === "rewrite") return "建议重写"
-  return "建议局部优化"
+function shouldSelectPlanStepByDefault(step: GalLonglineOptimizationPlan["steps"][number]): boolean {
+  if (!isExecutablePlanStep(step)) return false
+  if (step.risk === "high") return false
+  return step.priority === "high" || step.priority === "medium"
+}
+
+function priorityLabel(priority: GalLonglineOptimizationPlan["steps"][number]["priority"]): string {
+  if (priority === "high") return "高"
+  if (priority === "medium") return "中"
+  return "低"
+}
+
+function riskLabel(risk: GalLonglineOptimizationPlan["steps"][number]["risk"]): string {
+  if (risk === "high") return "高"
+  if (risk === "medium") return "中"
+  return "低"
+}
+
+function executionStatusLabel(status: GalLonglinePlanExecutionStep["status"]): string {
+  if (status === "pending") return "等待"
+  if (status === "running") return "执行中"
+  if (status === "succeeded") return "已完成"
+  if (status === "failed") return "失败"
+  return "已跳过"
 }
