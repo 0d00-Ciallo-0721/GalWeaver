@@ -89,6 +89,9 @@ export function GalLonglineWorkspace({
   const [planActionMessage, setPlanActionMessage] = useState<string | null>(null)
   const [executionReport, setExecutionReport] = useState<GalLonglinePlanExecutionReport | null>(null)
   const [executingPlan, setExecutingPlan] = useState(false)
+  const [editingStepId, setEditingStepId] = useState<string | null>(null)
+  const [editScope, setEditScope] = useState("")
+  const [editConstraints, setEditConstraints] = useState("")
   const [undoneStepIds, setUndoneStepIds] = useState<Set<string>>(new Set())
   const [undoSnapshots, setUndoSnapshots] = useState<Record<string, StepUndoSnapshot>>({})
   const [compareStepId, setCompareStepId] = useState<string | null>(null)
@@ -223,6 +226,28 @@ export function GalLonglineWorkspace({
     })
     setPlanActionMessage(null)
     setExecutionReport(null)
+  }
+  const handleStartEditStep = (stepId: string) => {
+    const step = optimizationPlan?.steps.find((s) => s.id === stepId)
+    if (!step) return
+    setEditingStepId(stepId)
+    setEditScope(step.scope)
+    setEditConstraints(step.constraints.join("\n"))
+  }
+  const handleSaveEditStep = () => {
+    if (!optimizationPlan || !editingStepId) return
+    setOptimizationPlan({
+      ...optimizationPlan,
+      steps: optimizationPlan.steps.map((s) =>
+        s.id === editingStepId
+          ? { ...s, scope: editScope.trim(), constraints: editConstraints.split("\n").map((c) => c.trim()).filter(Boolean) }
+          : s,
+      ),
+    })
+    setEditingStepId(null)
+  }
+  const handleCancelEditStep = () => {
+    setEditingStepId(null)
   }
   const handleExecuteSelectedPlan = async () => {
     if (!route || !range || !galStore.project || !optimizationPlan || !wikiProject?.path || executingPlan) return
@@ -495,11 +520,19 @@ export function GalLonglineWorkspace({
             undoneStepIds={undoneStepIds}
             undoSnapshots={undoSnapshots}
             compareStepId={compareStepId}
+            editingStepId={editingStepId}
+            editScope={editScope}
+            editConstraints={editConstraints}
             onSelectNode={(nodeId) => locateLonglineNode(nodeId, setActiveNodeId, galStore)}
             onStepSelectedChange={setPlanStepSelected}
             onExecuteSelected={handleExecuteSelectedPlan}
             onViewExecutionStep={handleViewExecutionStep}
             onUndoExecutionStep={handleUndoExecutionStep}
+            onStartEditStep={handleStartEditStep}
+            onSaveEditStep={handleSaveEditStep}
+            onCancelEditStep={handleCancelEditStep}
+            onEditScopeChange={setEditScope}
+            onEditConstraintsChange={setEditConstraints}
           />
         </aside>
       </div>
@@ -824,11 +857,19 @@ function OptimizationPanel({
   undoneStepIds,
   undoSnapshots,
   compareStepId,
+  editingStepId,
+  editScope,
+  editConstraints,
   onSelectNode,
   onStepSelectedChange,
   onExecuteSelected,
   onViewExecutionStep,
   onUndoExecutionStep,
+  onStartEditStep,
+  onSaveEditStep,
+  onCancelEditStep,
+  onEditScopeChange,
+  onEditConstraintsChange,
 }: {
   plan: GalLonglineOptimizationPlan | null
   error: string | null
@@ -839,11 +880,19 @@ function OptimizationPanel({
   undoneStepIds: Set<string>
   undoSnapshots: Record<string, StepUndoSnapshot>
   compareStepId: string | null
+  editingStepId: string | null
+  editScope: string
+  editConstraints: string
   onSelectNode: (nodeId: string) => void
   onStepSelectedChange: (stepId: string, selected: boolean) => void
   onExecuteSelected: () => void
   onViewExecutionStep: (step: GalLonglinePlanExecutionStep) => void
   onUndoExecutionStep: (step: GalLonglinePlanExecutionStep) => void
+  onStartEditStep: (stepId: string) => void
+  onSaveEditStep: () => void
+  onCancelEditStep: () => void
+  onEditScopeChange: (value: string) => void
+  onEditConstraintsChange: (value: string) => void
 }) {
   const selectedExecutableCount = plan?.steps.filter((step) => isExecutablePlanStep(step) && selectedStepIds.has(step.id)).length ?? 0
   return (
@@ -911,11 +960,49 @@ function OptimizationPanel({
                 </div>
                 <div className="mb-1 leading-5 text-muted-foreground">原因：{item.reason}</div>
                 <div className="mb-1 leading-5 text-muted-foreground">目标：{item.intent}</div>
-                <div className="mb-1 leading-5 text-muted-foreground">范围：{item.scope}</div>
-                {item.constraints.length > 0 && (
-                  <div className="leading-5 text-muted-foreground">
-                    约束：{item.constraints.join("；")}
+                {editingStepId === item.id ? (
+                  <div className="space-y-2">
+                    <div>
+                      <span className="text-[11px] font-medium">范围（可修改）：</span>
+                      <textarea
+                        value={editScope}
+                        onChange={(e) => onEditScopeChange(e.target.value)}
+                        className="mt-1 w-full rounded border bg-background p-2 text-[11px] leading-5"
+                        rows={3}
+                      />
+                    </div>
+                    <div>
+                      <span className="text-[11px] font-medium">约束（每行一条，可修改）：</span>
+                      <textarea
+                        value={editConstraints}
+                        onChange={(e) => onEditConstraintsChange(e.target.value)}
+                        className="mt-1 w-full rounded border bg-background p-2 text-[11px] leading-5"
+                        rows={3}
+                      />
+                    </div>
+                    <div className="flex gap-1">
+                      <button type="button" onClick={onSaveEditStep} className="rounded border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-400 hover:bg-emerald-500/20">
+                        保存修改
+                      </button>
+                      <button type="button" onClick={onCancelEditStep} className="rounded border px-3 py-1 text-[11px] hover:bg-accent">
+                        取消
+                      </button>
+                    </div>
                   </div>
+                ) : (
+                  <>
+                    <div className="mb-1 leading-5 text-muted-foreground">范围：{item.scope}</div>
+                    {item.constraints.length > 0 && (
+                      <div className="mb-1 leading-5 text-muted-foreground">
+                        约束：{item.constraints.join("；")}
+                      </div>
+                    )}
+                    {isExecutablePlanStep(item) && (
+                      <button type="button" onClick={() => onStartEditStep(item.id)} className="mt-1 rounded border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-accent">
+                        修改范围与约束
+                      </button>
+                    )}
+                  </>
                 )}
               </div>
             )) : <EmptyReportText />}

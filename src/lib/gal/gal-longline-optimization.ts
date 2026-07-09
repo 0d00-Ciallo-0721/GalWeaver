@@ -638,19 +638,9 @@ function isExecutablePlanStep(
   adjacentPairs: Set<string>,
 ): boolean {
   if (!item.reason || !item.intent || !item.scope) return false
-  if (item.type !== "insert_bridge_node" && planStepMentionsChoices(item)) return false
   if (item.type === "insert_bridge_node") {
     return Boolean(item.afterNodeId && item.beforeNodeId && adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`))
   }
   if (!item.targetNodeId || !targetIds.has(item.targetNodeId)) return false
   return item.type === "rewrite_node" || item.type === "skip"
-}
-
-function planStepMentionsChoices(item: GalLonglineOptimizationStep): boolean {
-  const text = `${item.reason}\n${item.intent}\n${item.scope}\n${item.constraints.join("\n")}`.toLowerCase()
-  return [
-    "选项", "選項", "choice", "option",
-    "分支", "分叉",
-    "三个", "三个选项",
-  ].some((keyword) => text.includes(keyword))
 }
