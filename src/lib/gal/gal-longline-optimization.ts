@@ -99,7 +99,7 @@ export async function generateGalLonglineOptimizationPlan(
   }
 
   // 3. 去重 + 过滤无效，记录被过滤的步骤
-  const adjacentPairs = buildAdjacentPairs(params.targetNodes)
+  const adjacentPairs = buildAdjacentPairs(params)
   const validated: GalLonglineOptimizationStep[] = []
   const filteredSteps: string[] = []
   for (const step of allSteps) {
@@ -259,6 +259,8 @@ async function buildPerFindingPlanPrompt(
     "- 禁止任何选项相关操作。",
     `- 类型约束：本发现类型为 ${finding.type}，通常对应 ${typeHint}。`,
     "- afterNodeId 和 beforeNodeId 必须使用下方「节点 ID 参考」中的真实 ID，不得填空字符串。",
+    "- insert_bridge_node 类型：afterNodeId 填前一节点 ID，beforeNodeId 填后一节点 ID，targetNodeId 留空。",
+    "- rewrite_node 类型：只填 targetNodeId，afterNodeId 和 beforeNodeId 留空。",
     "- 如果不需修改，输出 type=skip。",
     "",
     "## 检查发现",
@@ -537,12 +539,23 @@ function parseFixesResponse(raw: string): Array<{ stepId: string; scope?: string
 
 function normalizePlanStep(parsed: Partial<GalLonglineOptimizationStep>, findingId: string): GalLonglineOptimizationStep {
   const type = normalizeStepType(parsed.type)
+  let targetNodeId = parsed.targetNodeId?.trim() || undefined
+  let afterNodeId = parsed.afterNodeId?.trim() || undefined
+  let beforeNodeId = parsed.beforeNodeId?.trim() || undefined
+
+  // AI 经常把节点 ID 填入 targetNodeId 而非 afterNodeId/beforeNodeId
+  // 对 insert_bridge_node 类型自动纠正
+  if (type === "insert_bridge_node" && !afterNodeId && targetNodeId) {
+    afterNodeId = targetNodeId
+    targetNodeId = undefined
+  }
+
   return {
     id: `${findingId}_plan`,
     type,
-    targetNodeId: parsed.targetNodeId?.trim() || undefined,
-    afterNodeId: parsed.afterNodeId?.trim() || undefined,
-    beforeNodeId: parsed.beforeNodeId?.trim() || undefined,
+    targetNodeId,
+    afterNodeId,
+    beforeNodeId,
     title: parsed.title?.trim() || `${findingId}: ${type}`,
     reason: parsed.reason?.trim() || "",
     intent: parsed.intent?.trim() || "",
@@ -555,10 +568,19 @@ function normalizePlanStep(parsed: Partial<GalLonglineOptimizationStep>, finding
   }
 }
 
-function buildAdjacentPairs(targetNodes: GalLonglineReviewNodeInput[]): Set<string> {
+function buildAdjacentPairs(params: GalLonglineOptimizationParams): Set<string> {
   const pairs = new Set<string>()
-  for (let index = 0; index < targetNodes.length - 1; index += 1) {
-    pairs.add(`${targetNodes[index].node.id}->${targetNodes[index + 1].node.id}`)
+  // 目标节点内部链
+  for (let index = 0; index < params.targetNodes.length - 1; index += 1) {
+    pairs.add(`${params.targetNodes[index].node.id}->${params.targetNodes[index + 1].node.id}`)
+  }
+  // 边界链：上游 → 第一个目标节点
+  if (params.upstreamBoundary && params.targetNodes.length > 0) {
+    pairs.add(`${params.upstreamBoundary.node.id}->${params.targetNodes[0].node.id}`)
+  }
+  // 边界链：最后一个目标节点 → 下游
+  if (params.downstreamBoundary && params.targetNodes.length > 0) {
+    pairs.add(`${params.targetNodes[params.targetNodes.length - 1].node.id}->${params.downstreamBoundary.node.id}`)
   }
   return pairs
 }
@@ -667,7 +689,8 @@ function isExecutablePlanStep(
 ): boolean {
   if (!item.reason || !item.intent || !item.scope) return false
   if (item.type === "insert_bridge_node") {
-    return Boolean(item.afterNodeId && item.beforeNodeId && adjacentPairs.has(`${item.afterNodeId}->${item.beforeNodeId}`))
+    // Plan 层只校验字段非空，相邻性等业务校验留给 Do-Plan 的 validateBridgePlacement
+    return Boolean(item.afterNodeId && item.beforeNodeId)
   }
   if (!item.targetNodeId || !targetIds.has(item.targetNodeId)) return false
   return item.type === "rewrite_node" || item.type === "skip"
