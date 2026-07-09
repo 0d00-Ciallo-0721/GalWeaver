@@ -111,15 +111,18 @@ export async function generateGalLonglineOptimizationPlan(
     }
   }
 
+  // 3b. 程序化去重：同一 after/before 对的 bridge 只保留 priority 最高的
+  const deduped = deduplicateBridgeSteps(validated)
+
   // 4. Step 衔接审查
-  const coherenceReport = validated.length >= 2
-    ? await reviewStepCoherenceWithRetry(validated, llmConfig)
+  const coherenceReport = deduped.length >= 2
+    ? await reviewStepCoherenceWithRetry(deduped, llmConfig)
     : null
 
   // 5. 有冲突时修复（最多 1 次）
   const fixedSteps = coherenceReport && !coherenceReport.ok
-    ? await fixStepConflictsWithRetry(validated, coherenceReport.conflicts, llmConfig)
-    : validated
+    ? await fixStepConflictsWithRetry(deduped, coherenceReport.conflicts, llmConfig)
+    : deduped
 
   return {
     mode: params.mode,
@@ -565,6 +568,34 @@ function normalizePlanStep(parsed: Partial<GalLonglineOptimizationStep>, finding
     priority: normalizePriority(parsed.priority),
     risk: normalizeRisk(parsed.risk),
   }
+}
+
+/** 同一 after/before 对的 bridge step 只保留 priority 最高的 */
+function deduplicateBridgeSteps(steps: GalLonglineOptimizationStep[]): GalLonglineOptimizationStep[] {
+  const priorityOrder = { high: 3, medium: 2, low: 1 } as const
+  const seen = new Map<string, GalLonglineOptimizationStep>()
+
+  for (const step of steps) {
+    if (step.type !== "insert_bridge_node" || !step.afterNodeId || !step.beforeNodeId) continue
+    const key = `${step.afterNodeId}->${step.beforeNodeId}`
+    const existing = seen.get(key)
+    if (!existing || priorityOrder[step.priority] > priorityOrder[existing.priority]) {
+      if (existing) console.error(`[GalPlan] bridge 去重：${step.id}(p=${step.priority}) 替换 ${existing.id}(p=${existing.priority})`)
+      seen.set(key, step)
+    } else {
+      console.error(`[GalPlan] bridge 去重：丢弃 ${step.id}(p=${step.priority})，保留 ${existing.id}(${existing.priority})`)
+    }
+  }
+
+  return steps.map((step) => {
+    if (step.type !== "insert_bridge_node" || !step.afterNodeId || !step.beforeNodeId) return step
+    const key = `${step.afterNodeId}->${step.beforeNodeId}`
+    return seen.get(key) ?? step
+  }).filter((step, index, arr) => {
+    if (step.type !== "insert_bridge_node") return true
+    const key = `${step.afterNodeId}->${step.beforeNodeId}`
+    return arr.findIndex((s) => s.type === "insert_bridge_node" && `${s.afterNodeId}->${s.beforeNodeId}` === key) === index
+  })
 }
 
 // ═══════════════════════════════════════════════════════════════
