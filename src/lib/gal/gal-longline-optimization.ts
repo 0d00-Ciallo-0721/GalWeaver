@@ -99,11 +99,10 @@ export async function generateGalLonglineOptimizationPlan(
   }
 
   // 3. 去重 + 过滤无效，记录被过滤的步骤
-  const adjacentPairs = buildAdjacentPairs(params)
   const validated: GalLonglineOptimizationStep[] = []
   const filteredSteps: string[] = []
   for (const step of allSteps) {
-    if (isExecutablePlanStep(step, allowedNodeIds, adjacentPairs)) {
+    if (isExecutablePlanStep(step, allowedNodeIds)) {
       validated.push(step)
     } else {
       filteredSteps.push(step.id)
@@ -568,23 +567,6 @@ function normalizePlanStep(parsed: Partial<GalLonglineOptimizationStep>, finding
   }
 }
 
-function buildAdjacentPairs(params: GalLonglineOptimizationParams): Set<string> {
-  const pairs = new Set<string>()
-  // 目标节点内部链
-  for (let index = 0; index < params.targetNodes.length - 1; index += 1) {
-    pairs.add(`${params.targetNodes[index].node.id}->${params.targetNodes[index + 1].node.id}`)
-  }
-  // 边界链：上游 → 第一个目标节点
-  if (params.upstreamBoundary && params.targetNodes.length > 0) {
-    pairs.add(`${params.upstreamBoundary.node.id}->${params.targetNodes[0].node.id}`)
-  }
-  // 边界链：最后一个目标节点 → 下游
-  if (params.downstreamBoundary && params.targetNodes.length > 0) {
-    pairs.add(`${params.targetNodes[params.targetNodes.length - 1].node.id}->${params.downstreamBoundary.node.id}`)
-  }
-  return pairs
-}
-
 // ═══════════════════════════════════════════════════════════════
 // 已有辅助函数（保留）
 // ═══════════════════════════════════════════════════════════════
@@ -685,7 +667,6 @@ function normalizeRisk(value: unknown): GalLonglineOptimizationRisk {
 function isExecutablePlanStep(
   item: GalLonglineOptimizationStep,
   targetIds: Set<string>,
-  adjacentPairs: Set<string>,
 ): boolean {
   if (!item.reason || !item.intent || !item.scope) return false
   if (item.type === "insert_bridge_node") {
