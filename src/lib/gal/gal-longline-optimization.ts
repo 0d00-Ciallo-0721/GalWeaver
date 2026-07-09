@@ -140,7 +140,7 @@ function buildPlanSummary(
     parts.push(`${failedFindings.length} 项发现 AI 生成失败（${failedFindings.join("、")}），请检查模型连接后重试。`)
   }
   if (filteredSteps.length > 0) {
-    parts.push(`${filteredSteps.length} 个步骤被安全过滤（${filteredSteps.join("、")}），可能涉及选项操作。`)
+    parts.push(`${filteredSteps.length} 个步骤因不满足执行条件被过滤（${filteredSteps.join("、")}）。请检查步骤的 targetNodeId、scope、intent 是否有值，或节点是否在允许优化范围内。`)
   }
   return parts.join(" ")
 }
