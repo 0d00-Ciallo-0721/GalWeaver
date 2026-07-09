@@ -83,18 +83,34 @@ export async function generateGalLonglineOptimizationPlan(
     return { mode: params.mode, summary: "未发现需要优化的问题。", steps: [] }
   }
 
-  // 2. 串行为每个发现生成 Plan step
+  // 2. 串行为每个发现生成 Plan step，记录失败日志
   const allSteps: GalLonglineOptimizationStep[] = []
+  const failedFindings: string[] = []
   for (let index = 0; index < findings.length; index += 1) {
     const finding = findings[index]
     params.onFindingProgress?.(finding.id, index + 1, findings.length)
     const step = await generatePlanForFindingWithRetry(finding, params, llmConfig)
-    if (step) allSteps.push(step)
+    if (step) {
+      allSteps.push(step)
+    } else {
+      failedFindings.push(finding.id)
+      console.error(`[GalPlan] 发现 ${finding.id} 生成失败：3 次重试均未返回有效步骤。类型：${finding.type}，标题：${finding.title}`)
+    }
   }
 
-  // 3. 去重 + 过滤无效
+  // 3. 去重 + 过滤无效，记录被过滤的步骤
   const adjacentPairs = buildAdjacentPairs(params.targetNodes)
-  const validated = allSteps.filter((step) => isExecutablePlanStep(step, allowedNodeIds, adjacentPairs))
+  const validated: GalLonglineOptimizationStep[] = []
+  const filteredSteps: string[] = []
+  for (const step of allSteps) {
+    if (isExecutablePlanStep(step, allowedNodeIds, adjacentPairs)) {
+      validated.push(step)
+    } else {
+      filteredSteps.push(step.id)
+      const reason = `${step.type} target=${step.targetNodeId ?? "-"} reason="${step.reason.slice(0, 60)}" intent="${step.intent.slice(0, 60)}" scope="${step.scope.slice(0, 60)}"`
+      console.error(`[GalPlan] 步骤 ${step.id} 被过滤（isExecutablePlanStep 返回 false）：${reason}`)
+    }
+  }
 
   // 4. Step 衔接审查
   const coherenceReport = validated.length >= 2
@@ -108,9 +124,25 @@ export async function generateGalLonglineOptimizationPlan(
 
   return {
     mode: params.mode,
-    summary: `共 ${findings.length} 项发现，生成 ${fixedSteps.length} 个计划步骤。`,
+    summary: buildPlanSummary(findings.length, fixedSteps.length, failedFindings, filteredSteps),
     steps: fixedSteps,
   }
+}
+
+function buildPlanSummary(
+  totalFindings: number,
+  stepCount: number,
+  failedFindings: string[],
+  filteredSteps: string[],
+): string {
+  const parts = [`共 ${totalFindings} 项发现，生成 ${stepCount} 个计划步骤。`]
+  if (failedFindings.length > 0) {
+    parts.push(`${failedFindings.length} 项发现 AI 生成失败（${failedFindings.join("、")}），请检查模型连接后重试。`)
+  }
+  if (filteredSteps.length > 0) {
+    parts.push(`${filteredSteps.length} 个步骤被安全过滤（${filteredSteps.join("、")}），可能涉及选项操作。`)
+  }
+  return parts.join(" ")
 }
 
 // ─── Retry 包装 ─────────────────────────────────────────────
@@ -120,9 +152,13 @@ async function generatePlanForFindingWithRetry(
   params: GalLonglineOptimizationParams,
   llmConfig: LlmConfig,
 ): Promise<GalLonglineOptimizationStep | null> {
+  let lastError = ""
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try { return await generatePlanForFinding(finding, params, llmConfig) }
-    catch { /* retry */ }
+    catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+      console.error(`[GalPlan] 发现 ${finding.id} 第 ${attempt + 1}/3 次尝试失败：${lastError}`)
+    }
   }
   return null
 }

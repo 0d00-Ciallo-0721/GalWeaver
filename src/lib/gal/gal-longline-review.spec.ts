@@ -75,27 +75,24 @@ describe("reviewGalLongline", () => {
 })
 
 describe("generateGalLonglineOptimizationPlan", () => {
-  it("优化有问题节点时忽略已有检查报告里的补选项目标", async () => {
+  it("Per-Finding Plan 过滤涉及选项的 step", async () => {
+    const mockStep = {
+      type: "rewrite_node",
+      targetNodeId: "a",
+      title: "补充选项",
+      reason: "补充选项。",
+      intent: "增加分支选择。",
+      scope: "改写节点选项。",
+      constraints: ["补充三个选项"],
+      priority: "high",
+      risk: "medium",
+    }
+
     vi.mocked(streamChat).mockImplementation(async (_config, messages, callbacks) => {
-      expect(messages[1].content).toContain("steps")
+      // 验证新架构的 Per-Finding Plan prompt
+      expect(messages[1].content).toContain("对应发现")
       expect(messages[1].content).not.toContain("optimizedScript")
-      callbacks.onToken?.(JSON.stringify({
-        summary: "尝试补选项。",
-        steps: [
-          {
-            id: "step_1",
-            type: "rewrite_node",
-            targetNodeId: "a",
-            title: "补充选项",
-            reason: "补充选项。",
-            intent: "增加分支选择。",
-            scope: "改写节点选项。",
-            constraints: ["补充三个选项"],
-            priority: "high",
-            risk: "medium",
-          },
-        ],
-      }))
+      callbacks.onToken?.(JSON.stringify(mockStep))
       callbacks.onDone?.()
     })
 
