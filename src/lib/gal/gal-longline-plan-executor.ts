@@ -189,7 +189,7 @@ export async function insertBridgeNode(
         afterNodeId: placement.afterNode.id,
         beforeNodeId: placement.beforeNode.id,
         requireNodeIdsAdjacency: true,
-        requireSingleDirectConnection: true,
+        requireSingleDirectConnection: false,
         draft: {
           ...card,
           script,
@@ -417,8 +417,10 @@ function validateBridgePlacement(
     throw new Error("insert_bridge_node 只能插入当前长线中相邻的两个节点之间")
   }
   const outgoingTargets = getNodeLinkedTargetIds(afterNode)
-  if (outgoingTargets.length !== 1 || outgoingTargets[0] !== beforeNode.id || beforeNode.parents.length !== 1 || beforeNode.parents[0] !== afterNode.id) {
-    throw new Error("insert_bridge_node 要求前后节点当前是单线直连")
+  // 放宽：上下游边界可能分别有多个 children/parents（branch_node / merge_node）
+  // 只要这两个节点之间存在直连即可，不需要单线
+  if (!outgoingTargets.includes(beforeNode.id) || !beforeNode.parents.includes(afterNode.id)) {
+    throw new Error("insert_bridge_node 要求前后节点当前存在直连关系")
   }
   return { afterNode, beforeNode }
 }
