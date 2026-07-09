@@ -48,11 +48,19 @@ export function insertRelayNodeIntoProject(params: InsertRelayNodeParams): Inser
   const outgoingTargets = getNodeLinkedTargetIds(afterNode)
   const hasDirectConnection = outgoingTargets.includes(beforeNode.id) && beforeNode.parents.includes(afterNode.id)
   if (!hasDirectConnection) {
-    throw new Error("插入失败：前后节点当前不是直连关系")
+    throw new Error(
+      `插入失败：${afterNode.title}(${afterNode.id}) 与 ${beforeNode.title}(${beforeNode.id}) 不是直连关系。` +
+      `\n${afterNode.title} 的实际出口：${outgoingTargets.join("、") || "无"}` +
+      `\n${beforeNode.title} 的实际父节点：${beforeNode.parents.join("、") || "无"}`,
+    )
   }
+
   if (params.requireSingleDirectConnection !== false) {
     if (outgoingTargets.length !== 1 || outgoingTargets[0] !== beforeNode.id || beforeNode.parents.length !== 1) {
-      throw new Error("插入失败：前后节点当前不是单线直连关系")
+      throw new Error(
+        `插入失败：${afterNode.title}(${afterNode.id}) → ${beforeNode.title}(${beforeNode.id}) 不是单线直连。` +
+        `\n${afterNode.title} 出口数=${outgoingTargets.length}，${beforeNode.title} 父节点数=${beforeNode.parents.length}`,
+      )
     }
   }
 

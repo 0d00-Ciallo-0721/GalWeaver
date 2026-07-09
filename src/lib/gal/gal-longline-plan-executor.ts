@@ -420,7 +420,10 @@ function validateBridgePlacement(
   // 放宽：上下游边界可能分别有多个 children/parents（branch_node / merge_node）
   // 只要这两个节点之间存在直连即可，不需要单线
   if (!outgoingTargets.includes(beforeNode.id) || !beforeNode.parents.includes(afterNode.id)) {
-    throw new Error("insert_bridge_node 要求前后节点当前存在直连关系")
+    throw new Error(
+      `insert_bridge_node 直连失败：${afterNode.title}(${afterNode.id}) → ${beforeNode.title}(${beforeNode.id})。` +
+      `\n${afterNode.title} 出口=${outgoingTargets.join("、") || "无"}，${beforeNode.title} 父节点=${beforeNode.parents.join("、") || "无"}`,
+    )
   }
   return { afterNode, beforeNode }
 }
