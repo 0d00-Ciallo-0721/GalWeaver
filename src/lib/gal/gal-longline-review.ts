@@ -54,6 +54,63 @@ export interface GalLonglineReviewReport {
   rewriteTargets: GalLonglineRewriteTarget[]
 }
 
+// ─── 编号发现 ──────────────────────────────────────────────
+
+export interface GalLonglineFinding {
+  id: string
+  type: "issue" | "missingScript" | "continuityBreak" | "suggestedInsertion" | "rewriteTarget"
+  nodeId?: string
+  afterNodeId?: string
+  beforeNodeId?: string
+  title: string
+  detail: string
+}
+
+export function extractFindings(report: GalLonglineReviewReport): GalLonglineFinding[] {
+  const findings: GalLonglineFinding[] = []
+  let counter = 0
+  const nextId = () => { counter += 1; return `F-${counter}` }
+
+  for (const item of report.missingScripts) {
+    findings.push({
+      id: nextId(), type: "missingScript",
+      nodeId: item.nodeId, title: item.title,
+      detail: `节点「${item.title}」正文缺失，需补全完整正文。`,
+    })
+  }
+  for (const item of report.issues) {
+    findings.push({
+      id: nextId(), type: "issue",
+      nodeId: item.nodeId, title: item.title || item.nodeId,
+      detail: item.detail,
+    })
+  }
+  for (const item of report.continuityBreaks) {
+    findings.push({
+      id: nextId(), type: "continuityBreak",
+      afterNodeId: item.fromNodeId, beforeNodeId: item.toNodeId,
+      title: `${item.fromNodeId} -> ${item.toNodeId}`,
+      detail: `类型：${item.type}；${item.detail}`,
+    })
+  }
+  for (const item of report.suggestedInsertions) {
+    findings.push({
+      id: nextId(), type: "suggestedInsertion",
+      afterNodeId: item.afterNodeId, beforeNodeId: item.beforeNodeId,
+      title: item.title,
+      detail: `建议在 ${item.afterNodeId} -> ${item.beforeNodeId} 之间插入过渡节点：${item.reason}。目标：${item.goal}`,
+    })
+  }
+  for (const item of report.rewriteTargets) {
+    findings.push({
+      id: nextId(), type: "rewriteTarget",
+      nodeId: item.nodeId, title: item.title || item.nodeId,
+      detail: item.reason,
+    })
+  }
+  return findings
+}
+
 export async function reviewGalLongline(params: GalLonglineReviewParams): Promise<GalLonglineReviewReport> {
   const llmConfig = params.llmConfigOverride ?? useWikiStore.getState().llmConfig
   const targetIds = new Set(params.targetNodes.map(({ node }) => node.id))

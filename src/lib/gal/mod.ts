@@ -116,10 +116,12 @@ export type {
 } from "./gal-longline-range"
 
 export {
+  extractFindings,
   reviewGalLongline,
 } from "./gal-longline-review"
 export type {
   GalLonglineContinuityBreak,
+  GalLonglineFinding,
   GalLonglineIssue,
   GalLonglineReviewNodeInput,
   GalLonglineReviewParams,
@@ -139,6 +141,8 @@ export type {
   GalLonglineOptimizationStep,
   GalLonglineOptimizationStepType,
   GalLonglineOptimizeMode,
+  StepCoherenceConflict,
+  StepCoherenceReport,
 } from "./gal-longline-optimization"
 
 export {

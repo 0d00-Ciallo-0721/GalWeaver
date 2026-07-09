@@ -197,6 +197,9 @@ export function GalLonglineWorkspace({
               ? { node: range.downstreamBoundary, script: scripts[range.downstreamBoundary.id] ?? "" }
               : null,
             projectPath: wikiProject.path,
+            onFindingProgress: (findingId, index, total) => {
+              task.update(`正在为发现 ${findingId} 生成计划... (${index}/${total})`)
+            },
           })
           task.update(optimizeMode === "story_enhance" ? "剧情增强方案已生成。" : "优化方案已生成。")
           return result
