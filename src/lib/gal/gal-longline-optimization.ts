@@ -258,6 +258,7 @@ async function buildPerFindingPlanPrompt(
     "- 只输出一个 step 对象（不是数组）。",
     "- 禁止任何选项相关操作。",
     `- 类型约束：本发现类型为 ${finding.type}，通常对应 ${typeHint}。`,
+    "- afterNodeId 和 beforeNodeId 必须使用下方「节点 ID 参考」中的真实 ID，不得填空字符串。",
     "- 如果不需修改，输出 type=skip。",
     "",
     "## 检查发现",
@@ -267,11 +268,38 @@ async function buildPerFindingPlanPrompt(
     "## 项目核心上下文",
     contextReference,
     "",
+    "## 节点 ID 参考",
+    buildNodeIdReference(finding, params),
+    "",
     "## 问题节点上下文",
     nodeContext,
     "",
     `现在为发现 [${finding.id}] 输出一个计划步骤。`,
   ].join("\n")
+}
+
+// 给 AI 列出所有可用的节点 ID，防止 AI 不知道 ID 而填空值
+function buildNodeIdReference(
+  finding: GalLonglineFinding,
+  params: GalLonglineOptimizationParams,
+): string {
+  const lines: string[] = []
+  lines.push("以下是上下文中所有节点的 ID 映射，生成步骤时 afterNodeId/beforeNodeId/targetNodeId 必须从这里选取：")
+
+  if (params.upstreamBoundary) {
+    lines.push(`- 上游边界：ID=${params.upstreamBoundary.node.id}，标题=${params.upstreamBoundary.node.title}`)
+  }
+  if (params.downstreamBoundary) {
+    lines.push(`- 下游边界：ID=${params.downstreamBoundary.node.id}，标题=${params.downstreamBoundary.node.title}`)
+  }
+  for (const item of params.targetNodes) {
+    lines.push(`- 目标节点：ID=${item.node.id}，标题=${item.node.title}`)
+  }
+
+  if (finding.nodeId) {
+    lines.push("", `当前发现关联的节点 ID：${finding.nodeId}`)
+  }
+  return lines.join("\n")
 }
 
 function buildFindingNodeContext(
@@ -283,11 +311,11 @@ function buildFindingNodeContext(
     const parts: string[] = []
     if (finding.afterNodeId) {
       const after = params.targetNodes.find((item) => item.node.id === finding.afterNodeId)
-      if (after) parts.push(`上游节点结尾：\n${after.script.trim().slice(-800) || "（无正文）"}`)
+      if (after) parts.push(`上游节点（ID=${after.node.id}）结尾：\n${after.script.trim().slice(-800) || "（无正文）"}`)
     }
     if (finding.beforeNodeId) {
       const before = params.targetNodes.find((item) => item.node.id === finding.beforeNodeId)
-      if (before) parts.push(`下游节点开头：\n${before.script.trim().slice(0, 800) || "（无正文）"}`)
+      if (before) parts.push(`下游节点（ID=${before.node.id}）开头：\n${before.script.trim().slice(0, 800) || "（无正文）"}`)
     }
     return parts.join("\n\n") || "无关联节点上下文。"
   }
@@ -315,21 +343,21 @@ function buildFindingNodeContext(
   if (!isFirst) {
     const prev = params.targetNodes[targetIdx - 1]
     if (prev) {
-      lines.push("", "### 前一节点结尾", prev.script.trim().slice(-600) || "（无正文）")
+      lines.push("", `### 前一节点（ID=${prev.node.id}）结尾`, prev.script.trim().slice(-600) || "（无正文）")
     }
   }
   if (isFirst && params.upstreamBoundary) {
-    lines.push("", "### 上游边界结尾", params.upstreamBoundary.script.trim().slice(-800) || "（无正文）")
+    lines.push("", `### 上游边界（ID=${params.upstreamBoundary.node.id}）结尾`, params.upstreamBoundary.script.trim().slice(-800) || "（无正文）")
   }
 
   if (!isLast) {
     const next = params.targetNodes[targetIdx + 1]
     if (next) {
-      lines.push("", "### 后一节点开头", next.script.trim().slice(0, 600) || "（无正文）")
+      lines.push("", `### 后一节点（ID=${next.node.id}）开头`, next.script.trim().slice(0, 600) || "（无正文）")
     }
   }
   if (isLast && params.downstreamBoundary) {
-    lines.push("", "### 下游边界开头", params.downstreamBoundary.script.trim().slice(0, 800) || "（无正文）")
+    lines.push("", `### 下游边界（ID=${params.downstreamBoundary.node.id}）开头`, params.downstreamBoundary.script.trim().slice(0, 800) || "（无正文）")
   }
 
   return lines.join("\n")
