@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
+  buildAssetSlotsTemplate,
   buildStoryBundle,
   buildStoryNode,
   collectKnownCharacters,
@@ -266,7 +267,7 @@ describe("gal web export script parser", () => {
     ])
     expect(result.warnings).toEqual([
       {
-        code: "SCRIPT_LINE_FALLBACK_NARRATION",
+        code: "SCRIPT_LINE_FALLBACK",
         message: "正文行未匹配到结构化格式，已按旁白保留。",
         nodeId: "node_a",
         line: 5,
@@ -309,7 +310,7 @@ describe("gal web export script parser", () => {
     ])
     expect(result.warnings).toEqual([
       {
-        code: "SCRIPT_LINE_FALLBACK_NARRATION",
+        code: "SCRIPT_LINE_FALLBACK",
         message: "正文行未匹配到结构化格式，已按旁白保留。",
         nodeId: "node_plain",
         line: 1,
@@ -449,7 +450,7 @@ describe("gal web export story node builder", () => {
 
     expect(storyNode.nextNodeId).toBeUndefined()
     expect(report.errors).toEqual([{
-      code: "NODE_HAS_MULTIPLE_DIRECT_CHILDREN",
+      code: "AMBIGUOUS_LINEAR_CHILDREN",
       message: "Node start has multiple children but no choices.",
       nodeId: "start",
       routeId: "route",
@@ -496,7 +497,7 @@ describe("gal web export story node builder", () => {
       targetNodeId: "missing",
     })
     expect(report.errors).toEqual([{
-      code: "CHOICE_TARGET_NOT_FOUND",
+      code: "INVALID_CHOICE_TARGET",
       message: "Choice choice_missing on node start points to missing node missing.",
       nodeId: "start",
     }])
@@ -512,7 +513,7 @@ describe("gal web export story node builder", () => {
 
     expect(storyNode.nextNodeId).toBe("missing")
     expect(report.errors).toEqual([{
-      code: "NEXT_NODE_NOT_FOUND",
+      code: "INVALID_NEXT_NODE",
       message: "Node start points to missing child missing.",
       nodeId: "start",
       routeId: "route",
@@ -536,7 +537,7 @@ describe("gal web export story node builder", () => {
 
     expect(storyNode.choices[0].effects).toBeUndefined()
     expect(report.errors).toEqual([{
-      code: "CHOICE_EFFECT_VARIABLE_NOT_FOUND",
+      code: "INVALID_VARIABLE_REF",
       message: "Choice choice_bad_effect on node start references missing variable unknown.",
       nodeId: "start",
     }])
@@ -693,5 +694,197 @@ describe("gal web export story bundle builder", () => {
     })
     expect(report.stats.scriptsReady).toBe(5)
     expect(report.stats.scriptsMissing).toBe(1)
+  })
+
+  it("reports duplicate route, node, variable, and character ids", async () => {
+    const duplicatedNodeA = node("duplicate_node", "main")
+    const duplicatedNodeB = node("duplicate_node", "main")
+    const mainA = routeWithNodes([duplicatedNodeA, duplicatedNodeB], { id: "main", entryNodeId: "duplicate_node" })
+    const mainB = routeWithNodes([node("other_entry", "main")], { id: "main", entryNodeId: "other_entry" })
+    const sample = {
+      ...project([
+        { id: "var_duplicate", name: "Trust", type: "custom", defaultValue: 0, description: "" },
+        { id: "var_duplicate", name: "Trust again", type: "custom", defaultValue: 1, description: "" },
+      ]),
+      characters: [
+        { id: "character_duplicate", name: "Alex" },
+        { id: "character_duplicate", name: "Mika" },
+      ],
+      routes: [mainA, mainB],
+    } as GalProject & { characters: Array<{ id: string; name: string }> }
+    vi.mocked(loadNodeScript).mockResolvedValue("Alex: body")
+
+    const { report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+    const codes = report.errors.map((error) => error.code)
+
+    expect(codes).toContain("DUPLICATE_ROUTE_ID")
+    expect(codes).toContain("DUPLICATE_NODE_ID")
+    expect(codes).toContain("DUPLICATE_VARIABLE_ID")
+    expect(codes).toContain("DUPLICATE_CHARACTER_ID")
+  })
+
+  it("reports a missing entry node", async () => {
+    const main = routeWithNodes([node("actual_node", "main")], { id: "main", entryNodeId: "missing_entry" })
+    const sample: GalProject = { ...project(), routes: [main] }
+    vi.mocked(loadNodeScript).mockResolvedValue("Alex: body")
+
+    const { bundle, report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(bundle.entryNodeId).toBe("missing_entry")
+    expect(report.errors).toEqual(expect.arrayContaining([{
+      code: "MISSING_ENTRY_NODE",
+      message: "Entry node missing_entry does not exist in the story bundle.",
+      nodeId: "missing_entry",
+    }]))
+  })
+
+  it("reports duplicate choice ids inside one node", async () => {
+    const start = node("start", "main")
+    const first = node("first", "main")
+    const second = node("second", "main")
+    start.choices = [
+      { id: "same_choice", text: "First", emotionalIntent: "go first", effects: [], nextNodeId: "first" },
+      { id: "same_choice", text: "Second", emotionalIntent: "go second", effects: [], nextNodeId: "second" },
+    ]
+    const main = routeWithNodes([start, first, second], { id: "main", entryNodeId: "start" })
+    const sample: GalProject = { ...project(), routes: [main] }
+    vi.mocked(loadNodeScript).mockResolvedValue("Alex: body")
+
+    const { report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(report.errors).toEqual(expect.arrayContaining([{
+      code: "DUPLICATE_CHOICE_ID",
+      message: "Node start has duplicate choice id same_choice.",
+      nodeId: "start",
+      routeId: "main",
+    }]))
+  })
+
+  it("reports missing scripts as machine-readable warnings", async () => {
+    const main = countedGraphRoute("main", 1)
+    const sample: GalProject = { ...project(), routes: [main] }
+    vi.mocked(loadNodeScript).mockResolvedValue(null)
+
+    const { report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(report.warnings).toEqual(expect.arrayContaining([{
+      code: "SCRIPT_MISSING",
+      message: "Node main_0 has no script content.",
+      nodeId: "main_0",
+    }]))
+  })
+
+  it("reports when choices and children point to different targets", async () => {
+    const start = node("start", "main")
+    const choiceTarget = node("choice_target", "main")
+    const childTarget = node("child_target", "main")
+    start.choices = [{
+      id: "choice",
+      text: "Go by choice",
+      emotionalIntent: "choice target",
+      effects: [],
+      nextNodeId: "choice_target",
+    }]
+    start.children = ["child_target"]
+    const main = routeWithNodes([start, choiceTarget, childTarget], { id: "main", entryNodeId: "start" })
+    const sample: GalProject = { ...project(), routes: [main] }
+    vi.mocked(loadNodeScript).mockResolvedValue("Alex: body")
+
+    const { report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(report.warnings).toEqual(expect.arrayContaining([{
+      code: "CHOICES_CHILDREN_CONFLICT",
+      message: "Node start has choices and children pointing to different targets.",
+      nodeId: "start",
+    }]))
+    expect(report.errors).toEqual(expect.arrayContaining([{
+      code: "CHOICES_CHILDREN_CONFLICT",
+      message: "Route main node start has conflicting choices and children.",
+      nodeId: "start",
+      routeId: "main",
+    }]))
+  })
+})
+
+describe("gal web export asset slots template", () => {
+  it("creates asset slots for nodes with scene and characters", () => {
+    const template = buildAssetSlotsTemplate({
+      storyId: "story",
+      nodes: [{
+        id: "node_with_assets",
+        routeId: "main",
+        title: "Scene node",
+        type: "normal",
+        status: "ready",
+        scene: { description: "Rooftop at sunset" },
+        characterIds: ["character_alex", "character_mika"],
+        script: [],
+        choices: [],
+      }],
+    })
+
+    expect(template).toEqual({
+      schemaVersion: 1,
+      storyId: "story",
+      nodes: [{
+        nodeId: "node_with_assets",
+        title: "Scene node",
+        sceneDescription: "Rooftop at sunset",
+        characterIds: ["character_alex", "character_mika"],
+        backgroundId: null,
+        cgId: null,
+        characterSprites: [
+          { characterId: "character_alex", spriteId: null, position: null },
+          { characterId: "character_mika", spriteId: null, position: null },
+        ],
+      }],
+    })
+  })
+
+  it("creates complete empty slots for nodes without scene or characters", () => {
+    const template = buildAssetSlotsTemplate({
+      storyId: "story",
+      nodes: [{
+        id: "empty_node",
+        routeId: "main",
+        title: "Empty node",
+        type: "normal",
+        status: "missing-script",
+        characterIds: [],
+        script: [],
+        choices: [],
+      }],
+    })
+
+    expect(template.nodes).toEqual([{
+      nodeId: "empty_node",
+      title: "Empty node",
+      characterIds: [],
+      backgroundId: null,
+      cgId: null,
+      characterSprites: [],
+    }])
+  })
+
+  it("does not emit local file path guesses", () => {
+    const template = buildAssetSlotsTemplate({
+      storyId: "story",
+      nodes: [{
+        id: "path_guard",
+        routeId: "main",
+        title: "Path guard",
+        type: "normal",
+        status: "ready",
+        scene: { description: "No path should be generated here" },
+        characterIds: ["character_alex"],
+        script: [],
+        choices: [],
+      }],
+    })
+
+    const serialized = JSON.stringify(template)
+    expect(serialized).not.toMatch(/[A-Z]:[\\/]/)
+    expect(serialized).not.toContain("D:/")
+    expect(serialized).not.toContain("001.png")
   })
 })

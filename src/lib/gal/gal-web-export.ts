@@ -278,7 +278,7 @@ export function parseScriptBlocks(
 
     blocks.push({ id: blockId, type: "narration", text })
     warnings.push({
-      code: "SCRIPT_LINE_FALLBACK_NARRATION",
+      code: "SCRIPT_LINE_FALLBACK",
       message: "正文行未匹配到结构化格式，已按旁白保留。",
       nodeId,
       line: lineNumber,
@@ -351,7 +351,7 @@ export function buildStoryNode(
 
   if (children.length > 1) {
     report.errors.push({
-      code: "NODE_HAS_MULTIPLE_DIRECT_CHILDREN",
+      code: "AMBIGUOUS_LINEAR_CHILDREN",
       message: `Node ${node.id} has multiple children but no choices.`,
       nodeId: node.id,
       routeId: route.id,
@@ -363,7 +363,7 @@ export function buildStoryNode(
   storyNode.nextNodeId = nextNodeId
   if (!nodeById.has(nextNodeId)) {
     report.errors.push({
-      code: "NEXT_NODE_NOT_FOUND",
+      code: "INVALID_NEXT_NODE",
       message: `Node ${node.id} points to missing child ${nextNodeId}.`,
       nodeId: node.id,
       routeId: route.id,
@@ -383,7 +383,7 @@ export async function buildStoryBundle(
   const scriptsByNode = new Map<string, string>()
   const charactersByName = new Map<string, CharacterDefinition>()
 
-  for (const character of collectKnownCharacters({ routes: graphRoutes })) {
+  for (const character of collectKnownCharacters({ ...project, routes: graphRoutes })) {
     addKnownCharacter(charactersByName, character)
   }
 
@@ -427,21 +427,231 @@ export async function buildStoryBundle(
   }
 
   const mainGraphRoute = graphRoutes.find((route) => route.id === "main") ?? graphRoutes[0]
-  return {
-    bundle: {
-      schemaVersion: 1,
-      contentVersion: project.updatedAt || exportedAt,
-      storyId: project.id,
-      title: project.title,
-      exportedAt,
-      entryNodeId: mainGraphRoute?.entryNodeId ?? "",
-      variables: normalizeVariableDefinitions(project),
-      characters,
-      routes: storyRoutes,
-      nodes: storyNodes,
-    },
-    report,
+  const bundle: StoryBundle = {
+    schemaVersion: 1,
+    contentVersion: project.updatedAt || exportedAt,
+    storyId: project.id,
+    title: project.title,
+    exportedAt,
+    entryNodeId: mainGraphRoute?.entryNodeId ?? "",
+    variables: normalizeVariableDefinitions(project),
+    characters,
+    routes: storyRoutes,
+    nodes: storyNodes,
   }
+
+  validateStoryBundle(project, graphRoutes, bundle, report)
+  return { bundle, report }
+}
+
+export function buildAssetSlotsTemplate(bundle: Pick<StoryBundle, "storyId" | "nodes">): AssetSlotsTemplate {
+  return {
+    schemaVersion: 1,
+    storyId: bundle.storyId,
+    nodes: bundle.nodes.map((node) => ({
+      nodeId: node.id,
+      title: node.title,
+      ...(node.scene?.description ? { sceneDescription: node.scene.description } : {}),
+      characterIds: [...node.characterIds],
+      backgroundId: null,
+      cgId: null,
+      characterSprites: node.characterIds.map((characterId) => ({
+        characterId,
+        spriteId: null,
+        position: null,
+      })),
+    })),
+  }
+}
+
+function validateStoryBundle(
+  project: GalProject,
+  graphRoutes: GalRoute[],
+  bundle: StoryBundle,
+  report: ExportReport,
+): void {
+  reportDuplicateIds((project.routes ?? []).map((route) => route.id), "DUPLICATE_ROUTE_ID", "route", report)
+  reportDuplicateIds((project.variables ?? []).map((variable) => variable.id), "DUPLICATE_VARIABLE_ID", "variable", report)
+  reportDuplicateIds(bundle.nodes.map((node) => node.id), "DUPLICATE_NODE_ID", "node", report)
+  reportDuplicateIds(bundle.characters.map((character) => character.id), "DUPLICATE_CHARACTER_ID", "character", report)
+
+  const nodeIds = new Set(bundle.nodes.map((node) => node.id))
+  const variableIds = new Set(bundle.variables.map((variable) => variable.id))
+  const sourceNodesByKey = new Map<string, GalNode>()
+  for (const route of graphRoutes) {
+    for (const node of route.nodes ?? []) {
+      sourceNodesByKey.set(makeRouteNodeKey(route.id, node.id), node)
+      if (!nodeIds.has(node.id)) {
+        pushReportError(report, {
+          code: "GRAPH_NODE_MISSING_FROM_BUNDLE",
+          message: `Graph route ${route.id} node ${node.id} was not included in the story bundle.`,
+          nodeId: node.id,
+          routeId: route.id,
+        })
+      }
+    }
+  }
+
+  if (!bundle.entryNodeId || !nodeIds.has(bundle.entryNodeId)) {
+    pushReportError(report, {
+      code: "MISSING_ENTRY_NODE",
+      message: `Entry node ${bundle.entryNodeId || "(empty)"} does not exist in the story bundle.`,
+      nodeId: bundle.entryNodeId || undefined,
+    })
+  }
+
+  for (const node of bundle.nodes) {
+    reportDuplicateChoiceIds(node, report)
+    validateStoryNodeLinks(node, nodeIds, variableIds, report)
+
+    if (node.status === "missing-script") {
+      pushReportWarning(report, {
+        code: "SCRIPT_MISSING",
+        message: `Node ${node.id} has no script content.`,
+        nodeId: node.id,
+      })
+    }
+
+    const sourceNode = sourceNodesByKey.get(makeRouteNodeKey(node.routeId, node.id))
+    if (sourceNode) validateChoiceChildrenConsistency(sourceNode, node.routeId, report)
+  }
+}
+
+function reportDuplicateIds(
+  ids: string[],
+  code: string,
+  label: string,
+  report: ExportReport,
+): void {
+  const seen = new Set<string>()
+  const reported = new Set<string>()
+  for (const id of ids) {
+    if (!id || !seen.has(id)) {
+      if (id) seen.add(id)
+      continue
+    }
+    if (reported.has(id)) continue
+    reported.add(id)
+    pushReportError(report, {
+      code,
+      message: `Duplicate ${label} id ${id}.`,
+    })
+  }
+}
+
+function reportDuplicateChoiceIds(node: StoryNode, report: ExportReport): void {
+  const seen = new Set<string>()
+  const reported = new Set<string>()
+  for (const choice of node.choices) {
+    if (!seen.has(choice.id)) {
+      seen.add(choice.id)
+      continue
+    }
+    if (reported.has(choice.id)) continue
+    reported.add(choice.id)
+    pushReportError(report, {
+      code: "DUPLICATE_CHOICE_ID",
+      message: `Node ${node.id} has duplicate choice id ${choice.id}.`,
+      nodeId: node.id,
+      routeId: node.routeId,
+    })
+  }
+}
+
+function validateStoryNodeLinks(
+  node: StoryNode,
+  nodeIds: Set<string>,
+  variableIds: Set<string>,
+  report: ExportReport,
+): void {
+  if (node.nextNodeId && !nodeIds.has(node.nextNodeId)) {
+    pushReportError(report, {
+      code: "INVALID_NEXT_NODE",
+      message: `Node ${node.id} points to missing child ${node.nextNodeId}.`,
+      nodeId: node.id,
+      routeId: node.routeId,
+    })
+  }
+
+  for (const choice of node.choices) {
+    if (!choice.targetNodeId) {
+      pushReportError(report, {
+        code: "INVALID_CHOICE_TARGET",
+        message: `Choice ${choice.id} on node ${node.id} has no targetNodeId.`,
+        nodeId: node.id,
+      })
+    } else if (!nodeIds.has(choice.targetNodeId)) {
+      pushReportError(report, {
+        code: "INVALID_CHOICE_TARGET",
+        message: `Choice ${choice.id} on node ${node.id} points to missing node ${choice.targetNodeId}.`,
+        nodeId: node.id,
+      })
+    }
+
+    for (const effect of choice.effects ?? []) {
+      if (!variableIds.has(effect.variableId)) {
+        pushReportError(report, {
+          code: "INVALID_VARIABLE_REF",
+          message: `Choice ${choice.id} on node ${node.id} references missing variable ${effect.variableId}.`,
+          nodeId: node.id,
+        })
+      }
+    }
+  }
+}
+
+function validateChoiceChildrenConsistency(node: GalNode, routeId: string, report: ExportReport): void {
+  const choiceTargets = new Set((node.choices ?? [])
+    .map((choice) => choice.nextNodeId?.trim())
+    .filter((target): target is string => Boolean(target)))
+  const childTargets = new Set((node.children ?? [])
+    .map((child) => child.trim())
+    .filter((target): target is string => Boolean(target)))
+  if (choiceTargets.size === 0 || childTargets.size === 0) return
+
+  if (!setEquals(choiceTargets, childTargets)) {
+    pushReportWarning(report, {
+      code: "CHOICES_CHILDREN_CONFLICT",
+      message: `Node ${node.id} has choices and children pointing to different targets.`,
+      nodeId: node.id,
+    })
+    if (routeId) {
+      pushReportError(report, {
+        code: "CHOICES_CHILDREN_CONFLICT",
+        message: `Route ${routeId} node ${node.id} has conflicting choices and children.`,
+        nodeId: node.id,
+        routeId,
+      })
+    }
+  }
+}
+
+function setEquals(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== right.size) return false
+  for (const value of left) {
+    if (!right.has(value)) return false
+  }
+  return true
+}
+
+function pushReportError(report: ExportReport, error: ExportReport["errors"][number]): void {
+  if (report.errors.some((item) => (
+    item.code === error.code
+    && item.message === error.message
+    && item.nodeId === error.nodeId
+    && item.routeId === error.routeId
+  ))) return
+  report.errors.push(error)
+}
+
+function pushReportWarning(report: ExportReport, warning: ExportReport["warnings"][number]): void {
+  if (report.warnings.some((item) => (
+    item.code === warning.code
+    && item.message === warning.message
+    && item.nodeId === warning.nodeId
+    && item.line === warning.line
+  ))) return
+  report.warnings.push(warning)
 }
 
 function normalizeVariableDefinition(variable: GalVariable): VariableDefinition {
@@ -527,13 +737,13 @@ function buildStoryChoice(
   const targetNodeId = choice.nextNodeId?.trim() ?? ""
   if (!targetNodeId) {
     report.errors.push({
-      code: "CHOICE_MISSING_TARGET",
+      code: "INVALID_CHOICE_TARGET",
       message: `Choice ${id} on node ${nodeId} has no targetNodeId.`,
       nodeId,
     })
   } else if (!nodeById.has(targetNodeId)) {
     report.errors.push({
-      code: "CHOICE_TARGET_NOT_FOUND",
+      code: "INVALID_CHOICE_TARGET",
       message: `Choice ${id} on node ${nodeId} points to missing node ${targetNodeId}.`,
       nodeId,
     })
@@ -560,7 +770,7 @@ function mapStoryChoiceEffects(
     const variableId = resolveGalVariableId(effect.variable, variables)
     if (!variableId) {
       report.errors.push({
-        code: "CHOICE_EFFECT_VARIABLE_NOT_FOUND",
+        code: "INVALID_VARIABLE_REF",
         message: `Choice ${choiceId} on node ${nodeId} references missing variable ${effect.variable}.`,
         nodeId,
       })
