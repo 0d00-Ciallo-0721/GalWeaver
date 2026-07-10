@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { readFile, writeFile } from "@/commands/fs"
-import { buildGalNovelMarkdown, exportGalProjectContents, traceGalPathToEntry } from "./gal-export"
+import { buildGalNovelMarkdown, exportGalProjectContents, exportGalRouteTree, traceGalPathToEntry } from "./gal-export"
 import type { GalNode, GalProject, GalRoute } from "./gal-types"
 
 vi.mock("@/commands/fs", () => ({
@@ -124,6 +124,95 @@ describe("exportGalProjectContents", () => {
       // expect.stringContaining('"kind": "gal-route-export"'),
     */
     // )
+  })
+})
+
+describe("exportGalRouteTree", () => {
+  it("exports only the selected independent route tree", async () => {
+    vi.mocked(readFile).mockResolvedValue("selected route body")
+    vi.mocked(writeFile).mockResolvedValue()
+    const mainRoute = route([node("entry", "main entry", [], [])])
+    const sideNode = {
+      ...node("side_entry", "side entry", [], []),
+      routeId: "side",
+      scriptPath: "nodes/side/side_entry.md",
+    }
+    const sideRoute: GalRoute = {
+      id: "side",
+      title: "side route",
+      theme: "summer side story",
+      entryNodeId: "side_entry",
+      endingNodeIds: [],
+      nodes: [sideNode],
+    }
+    const project: GalProject = {
+      id: "project",
+      title: "Story",
+      premise: "",
+      globalRules: "",
+      variables: [],
+      routes: [mainRoute, sideRoute],
+      cgs: [],
+      clues: [],
+      createdAt: "",
+      updatedAt: "",
+    }
+
+    const result = await exportGalRouteTree("D:/project", "D:/exports", project, "side")
+
+    expect(result.nodeCount).toBe(1)
+    expect(result.missingNodes).toEqual([])
+    expect(vi.mocked(readFile)).toHaveBeenCalledWith("D:/project/.gal/nodes/side/side_entry.md")
+    expect(vi.mocked(writeFile).mock.calls.some(([path]) => (
+      typeof path === "string" && path.endsWith("/tree.json")
+    ))).toBe(true)
+    expect(vi.mocked(writeFile).mock.calls.some(([path]) => (
+      typeof path === "string" && path.endsWith("/tree.svg")
+    ))).toBe(true)
+    expect(vi.mocked(writeFile).mock.calls.some(([path]) => (
+      typeof path === "string" && path.includes("/节点正文/001-side entry.md")
+    ))).toBe(true)
+  })
+
+  it("keeps a large main tree separate from a small special route tree", async () => {
+    vi.mocked(readFile).mockResolvedValue("body")
+    vi.mocked(writeFile).mockResolvedValue()
+    const mainNodes = Array.from({ length: 141 }, (_, index) => (
+      node(`main_${index}`, `main ${index}`, index === 0 ? [] : [`main_${index - 1}`], [])
+    ))
+    const sideNodes = Array.from({ length: 4 }, (_, index) => ({
+      ...node(`side_${index}`, `side ${index}`, index === 0 ? [] : [`side_${index - 1}`], []),
+      routeId: "side",
+      scriptPath: `nodes/side/side_${index}.md`,
+    }))
+    const project: GalProject = {
+      id: "project",
+      title: "Story",
+      premise: "",
+      globalRules: "",
+      variables: [],
+      routes: [
+        { ...route(mainNodes), entryNodeId: "main_0", endingNodeIds: [] },
+        {
+          id: "side",
+          title: "side route",
+          theme: "",
+          entryNodeId: "side_0",
+          endingNodeIds: [],
+          nodes: sideNodes,
+        },
+      ],
+      cgs: [],
+      clues: [],
+      createdAt: "",
+      updatedAt: "",
+    }
+
+    const mainResult = await exportGalRouteTree("D:/project", "D:/exports", project, "main")
+    const sideResult = await exportGalRouteTree("D:/project", "D:/exports", project, "side")
+
+    expect(mainResult.nodeCount).toBe(141)
+    expect(sideResult.nodeCount).toBe(4)
   })
 })
 

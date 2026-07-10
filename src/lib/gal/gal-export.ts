@@ -27,6 +27,13 @@ export interface GalProjectExportResult {
   missingNodes: GalNode[]
 }
 
+export interface GalRouteTreeExportResult {
+  exportPath: string
+  nodeCount: number
+  missingNodes: GalNode[]
+  terminalNodeCount: number
+}
+
 const GAL_EXPORT_MARKER_FILE = ".qmai-export.json"
 
 export interface GalProjectImportResult {
@@ -151,6 +158,66 @@ export async function buildGalNovelMarkdown(
   }
 }
 
+export async function buildGalRouteTreeMarkdown(
+  projectPath: string,
+  routeId: string,
+  route: GalRoute,
+): Promise<GalNovelExport> {
+  const nodes = route.nodes ?? []
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const missingNodes: GalNode[] = []
+  const visited = new Set<string>()
+  const sections: string[] = [`# ${route.title}`]
+
+  if (route.theme?.trim()) {
+    sections.push(route.theme.trim())
+  }
+
+  const visit = async (node: GalNode, depth: number) => {
+    const headingDepth = Math.min(6, depth + 2)
+    const heading = "#".repeat(headingDepth)
+    if (visited.has(node.id)) {
+      sections.push(`${heading} ${node.title}（已在前文出现）`)
+      return
+    }
+    visited.add(node.id)
+
+    const script = (await loadNodeScript(projectPath, routeId, node.id))?.trim() ?? ""
+    sections.push(`${heading} ${node.title}`)
+    if (script) {
+      sections.push(script)
+    } else {
+      missingNodes.push(node)
+      sections.push("> 该节点正文尚未生成。")
+    }
+
+    const outgoing = getNodeOutgoingTargets(node, nodeById)
+    if (outgoing.length > 0) {
+      sections.push("**选项 / 后续：**")
+      sections.push(...outgoing.map((edge) => {
+        const target = nodeById.get(edge.targetId)
+        return `- ${edge.choiceText || "后续"} -> ${target?.title ?? edge.targetId}`
+      }))
+    }
+
+    for (const edge of outgoing) {
+      const target = nodeById.get(edge.targetId)
+      if (target) await visit(target, depth + 1)
+    }
+  }
+
+  const entry = route.entryNodeId ? nodeById.get(route.entryNodeId) : undefined
+  if (entry) await visit(entry, 0)
+  for (const node of nodes) {
+    if (!visited.has(node.id)) await visit(node, 0)
+  }
+
+  return {
+    content: `${sections.join("\n\n")}\n`,
+    missingNodes,
+  }
+}
+
 export async function saveGalNovelMarkdown(
   defaultName: string,
   content: string,
@@ -251,6 +318,75 @@ export async function exportGalProjectContents(
   return { exportPath, nodeCount, routeCount, missingNodes }
 }
 
+export async function exportGalRouteTree(
+  projectPath: string,
+  destinationRoot: string,
+  project: GalProject,
+  routeId: string,
+): Promise<GalRouteTreeExportResult> {
+  const resolved = resolveRouteTreeForExport(project, routeId)
+  if (!resolved) throw new Error("未找到要导出的线路树。")
+  const { route, scriptRouteId } = resolved
+  const exportPath = joinPath(
+    destinationRoot,
+    `${makeSafeExportName(project.title)}-${makeSafeExportName(route.title)}-树导出-${formatDate(new Date())}`,
+  )
+  const nodeDir = joinPath(exportPath, "节点正文")
+  await createDirectory(exportPath)
+  await createDirectory(nodeDir)
+  await writeFile(
+    joinPath(exportPath, GAL_EXPORT_MARKER_FILE),
+    JSON.stringify({
+      kind: "gal-route-tree-export",
+      projectId: project.id,
+      projectTitle: project.title,
+      routeId: route.id,
+      routeTitle: route.title,
+      exportedAt: new Date().toISOString(),
+    }, null, 2),
+  )
+
+  const missingNodes: GalNode[] = []
+  let nodeCount = 0
+  for (const node of route.nodes ?? []) {
+    const script = (await loadNodeScript(projectPath, scriptRouteId, node.id))?.trim() ?? ""
+    if (!script) missingNodes.push(node)
+    const nodeContent = [
+      `# ${node.title}`,
+      script || "> 该节点正文尚未生成。",
+    ].join("\n\n")
+    await writeFile(
+      joinPath(nodeDir, `${String(++nodeCount).padStart(3, "0")}-${makeSafeExportName(node.title)}.md`),
+      `${nodeContent}\n`,
+    )
+  }
+
+  await writeFile(
+    joinPath(exportPath, "tree.json"),
+    JSON.stringify({
+      projectId: project.id,
+      projectTitle: project.title,
+      route,
+    }, null, 2),
+  )
+  await writeFile(joinPath(exportPath, "tree.svg"), buildGalRouteSvg(route))
+  await writeFile(
+    joinPath(exportPath, "full-tree.md"),
+    (await buildGalRouteTreeMarkdown(projectPath, scriptRouteId, route)).content,
+  )
+  await writeFile(
+    joinPath(exportPath, "tree-overview.md"),
+    buildRouteTreeOverview(project, route, nodeCount, missingNodes),
+  )
+
+  return {
+    exportPath,
+    nodeCount,
+    missingNodes,
+    terminalNodeCount: getRouteTerminalNodes(route).length,
+  }
+}
+
 export async function canRestoreGalProjectExport(exportPath: string): Promise<boolean> {
   return fileExists(joinPath(exportPath, "graph.json"))
 }
@@ -265,25 +401,26 @@ export async function restoreGalProjectFromExport(
     throw new Error("导出目录里的 graph.json 没有可恢复的线路数据。")
   }
 
-  const mainRoute = project.routes.find((route) => route.id === "main")
-    ?? project.routes.find((route) => !Array.isArray(route.nodeIds))
-    ?? project.routes[0]
-  const mainNodes = mainRoute.nodes ?? []
+  const independentRoutes = project.routes.filter((route) => !Array.isArray(route.nodeIds))
   const exportedScripts = await loadExportedNodeScripts(exportPath)
 
   await saveGalProject(targetProjectPath, project)
 
+  let nodeCount = 0
   let scriptCount = 0
-  for (const [index, node] of mainNodes.entries()) {
-    const script = exportedScripts.byTitle.get(node.title)?.shift()
-      ?? exportedScripts.byIndex[index]
-      ?? ""
-    if (!script.trim()) continue
-    await saveNodeScript(targetProjectPath, mainRoute.id, node.id, script)
-    scriptCount++
+  for (const route of independentRoutes) {
+    for (const node of route.nodes ?? []) {
+      const index = nodeCount++
+      const script = exportedScripts.byTitle.get(node.title)?.shift()
+        ?? exportedScripts.byIndex[index]
+        ?? ""
+      if (!script.trim()) continue
+      await saveNodeScript(targetProjectPath, route.id, node.id, script)
+      scriptCount++
+    }
   }
 
-  return { nodeCount: mainNodes.length, scriptCount }
+  return { nodeCount, scriptCount }
 }
 
 export function buildGalRouteSvg(route: GalRoute): string {
@@ -381,6 +518,78 @@ function layoutSvgNodes(route: GalRoute): Map<string, { x: number; y: number }> 
     positions.set(node.id, { x: 40 + level * 340, y: 60 + row * 150 })
   }
   return positions
+}
+
+function resolveRouteTreeForExport(
+  project: GalProject,
+  routeId: string,
+): { route: GalRoute; scriptRouteId: string } | null {
+  const route = project.routes.find((item) => item.id === routeId)
+  if (!route) return null
+  if (!Array.isArray(route.nodeIds)) {
+    return { route, scriptRouteId: route.id }
+  }
+
+  const mainRoute = project.routes.find((item) => item.id === "main")
+    ?? project.routes.find((item) => !Array.isArray(item.nodeIds))
+    ?? project.routes[0]
+  const nodeById = new Map((mainRoute?.nodes ?? []).map((node) => [node.id, node]))
+  const nodes = (route.nodeIds ?? [])
+    .map((nodeId) => nodeById.get(nodeId))
+    .filter((node): node is GalNode => Boolean(node))
+  return {
+    route: {
+      ...route,
+      entryNodeId: nodes[0]?.id ?? route.entryNodeId,
+      endingNodeIds: (route.endingNodeIds ?? []).filter((nodeId) => nodes.some((node) => node.id === nodeId)),
+      nodes,
+    },
+    scriptRouteId: mainRoute?.id ?? route.id,
+  }
+}
+
+function getRouteTerminalNodes(route: GalRoute): GalNode[] {
+  const nodeById = new Map((route.nodes ?? []).map((node) => [node.id, node]))
+  return (route.nodes ?? []).filter((node) => getNodeOutgoingTargets(node, nodeById).length === 0)
+}
+
+function buildRouteTreeOverview(
+  project: GalProject,
+  route: GalRoute,
+  nodeCount: number,
+  missingNodes: GalNode[],
+): string {
+  const terminalNodes = getRouteTerminalNodes(route)
+  const lines = [
+    `# ${route.title} 树导出`,
+    "",
+    `- 所属项目：${project.title}`,
+    `- 线路 ID：${route.id}`,
+    `- 节点数：${nodeCount}`,
+    `- 末节点：${terminalNodes.length}`,
+    `- 缺失正文：${missingNodes.length}`,
+    "",
+    "## 线路说明",
+    "",
+    route.theme || "未填写线路说明。",
+  ]
+  if (terminalNodes.length > 0) {
+    lines.push(
+      "",
+      "## 末节点",
+      "",
+      ...terminalNodes.map((node) => `- ${node.title}（${node.id}）`),
+    )
+  }
+  if (missingNodes.length > 0) {
+    lines.push(
+      "",
+      "## 缺失正文",
+      "",
+      ...missingNodes.map((node) => `- ${node.title}（${node.id}）`),
+    )
+  }
+  return `${lines.join("\n")}\n`
 }
 
 function buildProjectOverview(

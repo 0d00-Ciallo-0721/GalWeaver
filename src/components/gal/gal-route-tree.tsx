@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react"
-import { AlertTriangle, ChevronDown, ChevronRight, Circle, FileDown, GitBranch, Loader2, Plus, Trash2 } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { AlertTriangle, ChevronDown, ChevronRight, Circle, FileDown, GitBranch, Loader2, Plus, Sparkles, Trash2 } from "lucide-react"
 import { useGalStore } from "@/stores/gal-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { loadGalProject, saveGalProject } from "@/lib/gal/gal-storage"
-import { exportGalProjectContents } from "@/lib/gal/gal-export"
+import { exportGalProjectContents, exportGalRouteTree } from "@/lib/gal/gal-export"
+import { generateNodeScript } from "@/lib/gal/gal-node-generation"
 import { hasNodeOutgoingTarget } from "@/lib/gal/gal-graph-normalize"
 import { pickDirectory } from "@/lib/platform"
 import { getNodeTypeColor } from "./gal-utils"
@@ -19,6 +20,7 @@ export function GalRouteTree() {
   const requestLocateNode = useGalStore((s) => s.requestLocateNode)
   const setProject = useGalStore((s) => s.setProject)
   const setError = useGalStore((s) => s.setError)
+  const runAiTask = useGalStore((s) => s.runAiTask)
   const [busy, setBusy] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [exportMessage, setExportMessage] = useState<string | null>(null)
@@ -49,24 +51,23 @@ export function GalRouteTree() {
     setProject(await loadGalProject(wikiProject.path))
   }
 
-  const handleAddPathRoute = async () => {
+  const handleAddSpecialRoute = async () => {
     if (!project || !wikiProject?.path || busy) return
     setBusy(true)
     setError(null)
     try {
       const now = new Date().toISOString()
-      const routeId = `path_${Date.now().toString(36)}`
-      const entryId = mainRoute?.entryNodeId || mainRoute?.nodes[0]?.id || ""
+      const routeId = createUniqueRouteId(routes)
+      const routeCount = routes.filter((route) => route.id !== mainRouteId).length + 1
       await persistProject({
         ...project,
         routes: [
           ...routes,
           {
             id: routeId,
-            title: "新线路",
-            theme: "主线路节点路径",
-            nodeIds: entryId ? [entryId] : [],
-            entryNodeId: entryId,
+            title: `新线路 ${routeCount}`,
+            theme: "",
+            entryNodeId: "",
             endingNodeIds: [],
             nodes: [],
           },
@@ -77,6 +78,74 @@ export function GalRouteTree() {
       selectRoute(routeId)
     } catch (err) {
       setError(err instanceof Error ? err.message : "新增线路失败")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleGenerateRouteEntry = async (routeId: string, entryPrompt: string) => {
+    if (!project || !wikiProject?.path || busy) return
+    const prompt = entryPrompt.trim()
+    if (!prompt) {
+      setError("请先填写新线路入口提示词")
+      return
+    }
+    const route = routes.find((item) => item.id === routeId)
+    if (!route || route.id === mainRouteId || Array.isArray(route.nodeIds)) return
+    if ((route.nodes ?? []).length > 0) {
+      setError("该线路已经有入口节点，不能重复生成入口")
+      return
+    }
+
+    setBusy(true)
+    setError(null)
+    try {
+      const now = new Date().toISOString()
+      const entryNode = createRouteEntryNode(route, prompt, now, routes)
+      const stagedProject = {
+        ...project,
+        routes: routes.map((item) => (
+          item.id === routeId
+            ? {
+                ...item,
+                theme: prompt,
+                entryNodeId: entryNode.id,
+                nodes: [entryNode],
+              }
+            : item
+        )),
+        updatedAt: now,
+      }
+      await persistProject(stagedProject)
+      selectRoute(routeId)
+      selectNode(entryNode.id)
+
+      await runAiTask(
+        {
+          title: `生成线路入口：${route.title}`,
+          detail: "正在基于入口提示词和完整项目上下文生成入口正文...",
+          maxRetries: 2,
+        },
+        (task) => generateNodeScript({
+          projectPath: wikiProject.path,
+          routeId,
+          nodeId: entryNode.id,
+          userPrompt: [
+            "这是一个独立特殊线路的入口节点。",
+            "必须严格位于作品大纲与人物设定之内，但不要复用主线路节点数据。",
+            "请基于下面的线路入口提示词，生成能开启该特殊线路的完整入口正文。",
+            prompt,
+          ].join("\n"),
+          onToken: () => task.update("正在生成入口正文..."),
+        }),
+      )
+
+      const reloaded = await loadGalProject(wikiProject.path)
+      if (reloaded) setProject(reloaded)
+      selectRoute(routeId)
+      selectNode(entryNode.id)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "生成线路入口失败")
     } finally {
       setBusy(false)
     }
@@ -207,12 +276,41 @@ export function GalRouteTree() {
     }
   }
 
+  const handleExportRouteTree = async (routeId: string) => {
+    if (!project || !wikiProject?.path || exporting) return
+    setExporting(true)
+    setExportMessage(null)
+    setExportMissingNodes([])
+    setError(null)
+    try {
+      const destination = await pickDirectory()
+      if (!destination) return
+      const result = await exportGalRouteTree(
+        wikiProject.path,
+        destination,
+        project,
+        routeId,
+      )
+      setExportMissingNodes(result.missingNodes)
+      setExportMessage(
+        `已导出当前树：${result.nodeCount} 个节点，${result.terminalNodeCount} 个末节点`
+        + (result.missingNodes.length > 0
+          ? `，${result.missingNodes.length} 个节点缺少正文`
+          : ""),
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出线路树失败")
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <Header
         busy={busy}
         exporting={exporting}
-        onAddRoute={handleAddPathRoute}
+        onAddRoute={handleAddSpecialRoute}
         onExport={() => void handleExportAll()}
       />
       {exportMessage && (
@@ -250,32 +348,33 @@ export function GalRouteTree() {
       <div className="flex-1 overflow-y-auto p-1">
         {routes.map((route) => {
           const isMainRoute = route.id === mainRouteId
-          const pathNodes = Array.isArray(route.nodeIds)
-            ? route.nodeIds
+          const isPathRoute = !isMainRoute && Array.isArray(route.nodeIds)
+          const pathNodes = isPathRoute
+            ? (route.nodeIds ?? [])
                 .map((nodeId) => mainNodeById.get(nodeId))
                 .filter((node): node is GalNode => Boolean(node))
             : []
-          const sectionRoute = isMainRoute ? route : { ...route, nodes: pathNodes }
+          const sectionRoute = isPathRoute ? { ...route, nodes: pathNodes } : route
           return (
             <RouteSection
               key={route.id}
               route={sectionRoute}
               isMainRoute={isMainRoute}
+              isPathRoute={isPathRoute}
               mainNodeById={mainNodeById}
               selectedRouteId={selectedRouteId}
               selectedNodeId={selectedNodeId}
               busy={busy}
               onSelectRoute={() => {
                 selectRoute(route.id)
-                if (!isMainRoute) selectNode(null)
+                if (isPathRoute) selectNode(null)
               }}
               onSelectNode={(nodeId) => {
-                if (!isMainRoute) return
                 selectRoute(route.id)
                 selectNode(nodeId)
               }}
+              onExportTree={() => handleExportRouteTree(route.id)}
               onLocateNode={(nodeId) => {
-                if (!isMainRoute) return
                 selectRoute(route.id)
                 selectNode(null)
                 requestLocateNode(nodeId)
@@ -295,6 +394,8 @@ export function GalRouteTree() {
                   nodeIds: currentNodeIds.slice(0, Math.max(1, currentNodeIds.length - 1)),
                 })
               }}
+              onSaveEntryPrompt={(entryPrompt) => updatePathRoute(route.id, { theme: entryPrompt })}
+              onGenerateEntry={(entryPrompt) => handleGenerateRouteEntry(route.id, entryPrompt)}
               onDeleteRoute={() => handleDeletePathRoute(route.id)}
             />
           )
@@ -346,44 +447,61 @@ function Header({
 function RouteSection({
   route,
   isMainRoute,
+  isPathRoute,
   mainNodeById,
   selectedRouteId,
   selectedNodeId,
   busy,
   onSelectRoute,
   onSelectNode,
+  onExportTree,
   onLocateNode,
   onAddLooseNode,
   onRename,
   onAppendNode,
   onRemoveLast,
+  onSaveEntryPrompt,
+  onGenerateEntry,
   onDeleteRoute,
 }: {
   route: GalRoute
   isMainRoute: boolean
+  isPathRoute: boolean
   mainNodeById: Map<string, GalNode>
   selectedRouteId: string | null
   selectedNodeId: string | null
   busy: boolean
   onSelectRoute: () => void
   onSelectNode: (nodeId: string) => void
+  onExportTree: () => void
   onLocateNode: (nodeId: string) => void
   onAddLooseNode: () => void
   onRename: (title: string) => void
   onAppendNode: (nodeId: string) => void
   onRemoveLast: () => void
+  onSaveEntryPrompt: (entryPrompt: string) => void
+  onGenerateEntry: (entryPrompt: string) => void
   onDeleteRoute: () => void
 }) {
   const [expanded, setExpanded] = useState(true)
   const [renaming, setRenaming] = useState(false)
   const [renameValue, setRenameValue] = useState(route.title)
-  const nodes = isMainRoute ? sortNodes(route.nodes ?? []) : (route.nodes ?? [])
-  const candidateNodes = isMainRoute ? [] : getNextPathCandidates(route, mainNodeById)
+  const [entryPrompt, setEntryPrompt] = useState(route.theme ?? "")
+  const nodes = isMainRoute ? sortNodes(route.nodes ?? []) : sortNodes(route.nodes ?? [])
+  const candidateNodes = isPathRoute ? getNextPathCandidates(route, mainNodeById) : []
   const nodeById = useMemo(
     () => new Map((route.nodes ?? []).map((node) => [node.id, node])),
     [route.nodes],
   )
-  const outgoingNodeById = isMainRoute ? nodeById : mainNodeById
+  const outgoingNodeById = isPathRoute ? mainNodeById : nodeById
+
+  useEffect(() => {
+    setRenameValue(route.title)
+  }, [route.title])
+
+  useEffect(() => {
+    setEntryPrompt(route.theme ?? "")
+  }, [route.theme])
 
   return (
     <div>
@@ -407,7 +525,7 @@ function RouteSection({
       {expanded && (
         <div className="ml-4 border-l pl-2">
           {isMainRoute ? (
-            <div className="py-1">
+            <div className="space-y-1 py-1">
               <button
                 type="button"
                 disabled={busy}
@@ -416,6 +534,16 @@ function RouteSection({
               >
                 <Plus className="h-3 w-3" />
                 空节点
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onExportTree}
+                className="inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] text-muted-foreground hover:bg-accent disabled:opacity-40"
+                title="Export current route tree"
+              >
+                <FileDown className="h-3 w-3" />
+                导出此树
               </button>
             </div>
           ) : (
@@ -448,7 +576,16 @@ function RouteSection({
                     }}
                     className="min-w-0 flex-1 rounded-md border px-2 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent"
                   >
-                    重命名
+                    改名：{route.title}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={onExportTree}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border text-muted-foreground hover:bg-accent disabled:opacity-40"
+                    title="Export current route tree"
+                  >
+                    <FileDown className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
@@ -461,32 +598,66 @@ function RouteSection({
                   </button>
                 </div>
               )}
-              <div className="flex items-center gap-1">
-                <select
-                  disabled={busy || candidateNodes.length === 0}
-                  className="h-7 min-w-0 flex-1 rounded border bg-background px-2 text-xs"
-                  defaultValue=""
-                  onChange={(event) => {
-                    const nodeId = event.target.value
-                    event.currentTarget.value = ""
-                    if (nodeId) onAppendNode(nodeId)
-                  }}
-                >
-                  <option value="">选择下一个主线节点</option>
-                  {candidateNodes.map((node) => (
-                    <option key={node.id} value={node.id}>{node.title}</option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  disabled={busy || (route.nodeIds?.length ?? 0) <= 1}
-                  onClick={onRemoveLast}
-                  className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-40"
-                  title="移除路径末尾节点"
-                >
-                  退一步
-                </button>
-              </div>
+              {isPathRoute ? (
+                <div className="flex items-center gap-1">
+                  <select
+                    disabled={busy || candidateNodes.length === 0}
+                    className="h-7 min-w-0 flex-1 rounded border bg-background px-2 text-xs"
+                    defaultValue=""
+                    onChange={(event) => {
+                      const nodeId = event.target.value
+                      event.currentTarget.value = ""
+                      if (nodeId) onAppendNode(nodeId)
+                    }}
+                  >
+                    <option value="">选择下一个主线节点</option>
+                    {candidateNodes.map((node) => (
+                      <option key={node.id} value={node.id}>{node.title}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={busy || (route.nodeIds?.length ?? 0) <= 1}
+                    onClick={onRemoveLast}
+                    className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-40"
+                    title="移除路径末尾节点"
+                  >
+                    退一步
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1 rounded-md border border-dashed p-2">
+                  <div className="text-[11px] font-medium text-muted-foreground">
+                    入口提示词
+                  </div>
+                  <textarea
+                    value={entryPrompt}
+                    onChange={(event) => setEntryPrompt(event.target.value)}
+                    placeholder="描述这条特殊线路的入口事件、人物状态、场景和想要的剧情方向..."
+                    className="min-h-20 w-full resize-y rounded border bg-background px-2 py-1.5 text-xs"
+                  />
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onSaveEntryPrompt(entryPrompt.trim())}
+                      className="rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-40"
+                    >
+                      保存提示词
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy || nodes.length > 0 || entryPrompt.trim().length === 0}
+                      onClick={() => onGenerateEntry(entryPrompt)}
+                      className="inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-40"
+                      title={nodes.length > 0 ? "该线路已经有入口节点" : "基于提示词生成独立线路入口"}
+                    >
+                      <Sparkles className="h-3 w-3" />
+                      生成入口
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -499,7 +670,7 @@ function RouteSection({
             <div
               key={`${node.id}-${index}`}
               className={`flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-xs transition-colors ${
-                selectedNodeId === node.id && isMainRoute
+                selectedNodeId === node.id && !isPathRoute
                   ? "bg-primary/10 text-primary"
                   : "text-foreground hover:bg-accent/50"
               }`}
@@ -508,23 +679,23 @@ function RouteSection({
                 type="button"
                 onClick={() => onSelectNode(node.id)}
                 onContextMenu={(event) => {
-                  if (!isMainRoute) return
+                  if (isPathRoute) return
                   event.preventDefault()
                   onLocateNode(node.id)
                 }}
-                className={`flex min-w-0 flex-1 items-center gap-1.5 text-left ${isMainRoute ? "" : "cursor-default"}`}
-                title={isMainRoute ? "左键编辑，右键在画布中定位" : undefined}
+                className={`flex min-w-0 flex-1 items-center gap-1.5 text-left ${isPathRoute ? "cursor-default" : ""}`}
+                title={isPathRoute ? undefined : "左键编辑，右键在画布中定位"}
               >
                 <Circle className={`h-2 w-2 shrink-0 ${unfinishedTerminal ? "text-orange-300" : "text-muted-foreground/50"}`} />
                 <span className={`truncate ${nodeTitleColor}`}>{node.title}</span>
               </button>
-              {!isMainRoute && index < nodes.length - 1 && (
+              {isPathRoute && index < nodes.length - 1 && (
                 <span className="text-[10px] text-muted-foreground">→</span>
               )}
               {unfinishedTerminal && (
                 <span className="shrink-0 text-[10px] font-semibold text-orange-300">!</span>
               )}
-              {isMainRoute && node.status !== "card" && (
+              {!isPathRoute && node.status !== "card" && (
                 <span className="shrink-0 text-[10px] text-muted-foreground">
                   {node.status === "final" ? "✓" : "•"}
                 </span>
@@ -536,6 +707,69 @@ function RouteSection({
       )}
     </div>
   )
+}
+
+function createUniqueRouteId(routes: GalRoute[]): string {
+  const existing = new Set(routes.map((route) => route.id))
+  let routeId = `route_${Date.now().toString(36)}`
+  while (existing.has(routeId)) {
+    routeId = `route_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+  }
+  return routeId
+}
+
+function createUniqueRouteNodeId(routeId: string, routes: GalRoute[]): string {
+  const existing = new Set(routes.flatMap((route) => (route.nodes ?? []).map((node) => node.id)))
+  let nodeId = `${routeId}_entry`
+  if (!existing.has(nodeId)) return nodeId
+  nodeId = `${routeId}_entry_${Date.now().toString(36)}`
+  while (existing.has(nodeId)) {
+    nodeId = `${routeId}_entry_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+  }
+  return nodeId
+}
+
+function createRouteEntryNode(
+  route: GalRoute,
+  entryPrompt: string,
+  now: string,
+  routes: GalRoute[],
+): GalNode {
+  const nodeId = createUniqueRouteNodeId(route.id, routes)
+  return {
+    id: nodeId,
+    routeId: route.id,
+    title: route.title || "新线路入口",
+    type: "entry",
+    status: "card",
+    parents: [],
+    children: [],
+    goal: entryPrompt,
+    summary: entryPrompt,
+    scriptPath: `nodes/${route.id}/${nodeId}.md`,
+    incomingState: createEmptyStateSnapshot(),
+    choices: [],
+    memoryScope: "route",
+    characters: [],
+    scene: "",
+    aiPrompt: entryPrompt,
+    clueIds: [],
+    sequence: 1,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function createEmptyStateSnapshot(): GalNode["incomingState"] {
+  return {
+    variables: {},
+    characterCognition: {},
+    acquiredClueIds: [],
+    seenCgIds: [],
+    visitedNodeIds: [],
+    currentScene: "",
+    characterMoods: {},
+  }
 }
 
 function getNextPathCandidates(route: GalRoute, mainNodeById: Map<string, GalNode>): GalNode[] {

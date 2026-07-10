@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Galgame 鍓ф湰瀛樺偍灞? *
  * 璐熻矗 .gal/ 鐩綍涓嬫墍鏈夋暟鎹殑鎸佷箙鍖栬鍐欍€? * 澶嶇敤鐜版湁 Tauri FS 鍛戒护锛坮eadFile / writeFileAtomic / createDirectory / listDirectory / fileExists锛夈€? *
  * 鐩綍缁撴瀯锛? * project/
@@ -171,7 +171,7 @@ export async function loadGalProject(projectPath: string): Promise<GalProject | 
         id: meta.id,
         title: typeof meta.title === "string" ? meta.title : "未命名线路",
         theme: typeof meta.theme === "string" ? meta.theme : "",
-        nodeIds: Array.isArray(meta.nodeIds) ? meta.nodeIds : [],
+        ...(Array.isArray(meta.nodeIds) ? { nodeIds: meta.nodeIds } : {}),
         entryNodeId: typeof meta.entryNodeId === "string" ? meta.entryNodeId : "",
         endingNodeIds: Array.isArray(meta.endingNodeIds) ? meta.endingNodeIds : [],
         nodes: [],
