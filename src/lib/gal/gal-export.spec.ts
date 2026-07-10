@@ -165,6 +165,9 @@ describe("exportGalProjectContents", () => {
     const storyBundleCall = vi.mocked(writeFile).mock.calls.find(([path]) => (
       String(path).includes("/game-content/story.bundle.json")
     ))
+    const assetSlotsCall = vi.mocked(writeFile).mock.calls.find(([path]) => (
+      String(path).includes("/game-content/asset-slots.template.json")
+    ))
     const reportCall = vi.mocked(writeFile).mock.calls.find(([path]) => (
       String(path).includes("/game-content/export-report.json")
     ))
@@ -174,6 +177,11 @@ describe("exportGalProjectContents", () => {
       storyId: "project",
       title: "Story",
       entryNodeId: "entry",
+    })
+    expect(JSON.parse(String(assetSlotsCall?.[1]))).toMatchObject({
+      schemaVersion: 1,
+      storyId: "project",
+      nodes: [{ nodeId: "entry", title: "entry" }],
     })
     expect(JSON.parse(String(reportCall?.[1]))).toMatchObject({
       schemaVersion: 1,
