@@ -1,4 +1,7 @@
-import type { GalProject, GalRoute, GalVariable } from "./gal-types"
+import { getNodeOutgoingTargets } from "./gal-graph-normalize"
+import { loadNodeScript } from "./gal-storage"
+import { resolveGalVariableId } from "./gal-variable-guard"
+import type { GalNode, GalProject, GalRoute, GalVariable } from "./gal-types"
 
 export interface StoryBundle {
   schemaVersion: 1
@@ -94,6 +97,12 @@ export type KnownCharacter = CharacterDefinition | string
 export interface ScriptParseResult {
   blocks: ScriptBlock[]
   warnings: ExportReport["warnings"]
+  characters: CharacterDefinition[]
+}
+
+export interface StoryBundleBuildResult {
+  bundle: StoryBundle
+  report: ExportReport
 }
 
 export interface StoryChoice {
@@ -219,6 +228,7 @@ export function parseScriptBlocks(
   const blocks: ScriptBlock[] = []
   const warnings: ExportReport["warnings"] = []
   const charactersByName = buildCharacterMap(knownCharacters)
+  const usedCharactersById = new Map<string, CharacterDefinition>()
   const lines = rawScript.split(/\r?\n/)
 
   for (const [lineIndex, rawLine] of lines.entries()) {
@@ -236,10 +246,12 @@ export function parseScriptBlocks(
 
     const thoughtMatch = text.match(/^([^：:]+)[：:]\s*（内心）\s*(.*)$/)
     if (thoughtMatch) {
+      const speaker = resolveSpeaker(nodeId, thoughtMatch[1].trim(), charactersByName, warnings, lineNumber)
+      usedCharactersById.set(speaker.id, speaker)
       blocks.push({
         id: blockId,
         type: "thought",
-        speakerId: resolveSpeakerId(nodeId, thoughtMatch[1].trim(), charactersByName, warnings, lineNumber),
+        speakerId: speaker.id,
         text: thoughtMatch[2].trim(),
       })
       continue
@@ -247,10 +259,12 @@ export function parseScriptBlocks(
 
     const dialogueMatch = text.match(/^([^：:]+)[：:]\s*(.+)$/)
     if (dialogueMatch) {
+      const speaker = resolveSpeaker(nodeId, dialogueMatch[1].trim(), charactersByName, warnings, lineNumber)
+      usedCharactersById.set(speaker.id, speaker)
       blocks.push({
         id: blockId,
         type: "dialogue",
-        speakerId: resolveSpeakerId(nodeId, dialogueMatch[1].trim(), charactersByName, warnings, lineNumber),
+        speakerId: speaker.id,
         text: dialogueMatch[2].trim(),
       })
       continue
@@ -271,7 +285,163 @@ export function parseScriptBlocks(
     })
   }
 
-  return { blocks, warnings }
+  return { blocks, warnings, characters: [...usedCharactersById.values()] }
+}
+
+export function buildStoryNode(
+  node: GalNode,
+  route: GalRoute,
+  nodeById: Map<string, GalNode>,
+  script: string,
+  variables: readonly GalVariable[],
+  report: ExportReport,
+  knownCharacters: KnownCharacter[] = collectKnownCharacters({ routes: [route] }),
+): StoryNode {
+  const parsedScript = parseScriptBlocks(node.id, script, knownCharacters)
+  const knownCharacterDefinitions = normalizeKnownCharacterDefinitions(knownCharacters)
+  report.warnings.push(...parsedScript.warnings)
+
+  const type = mapStoryNodeType(node, route)
+  const choices = (node.choices ?? []).map((choice, index) =>
+    buildStoryChoice(node.id, choice, index, nodeById, variables, report),
+  )
+  const outgoingTargets = getNodeOutgoingTargets(node, nodeById)
+  const hasChoices = choices.length > 0
+  const storyNode: StoryNode = {
+    id: node.id,
+    routeId: route.id,
+    title: node.title,
+    type,
+    status: script.trim() ? "ready" : "missing-script",
+    ...(node.scene?.trim()
+      ? { scene: { description: node.scene.trim() } }
+      : {}),
+    characterIds: collectNodeCharacterIds(node, knownCharacterDefinitions),
+    script: parsedScript.blocks,
+    choices,
+    ...(type === "ending" ? { endingId: node.id } : {}),
+    meta: {
+      ...(node.summary?.trim() ? { summary: node.summary.trim() } : {}),
+      ...(node.goal?.trim() ? { goal: node.goal.trim() } : {}),
+      ...(node.clueIds?.length ? { tags: [...node.clueIds] } : {}),
+    },
+  }
+
+  if (type === "ending" && outgoingTargets.length > 0) {
+    report.warnings.push({
+      code: "ENDING_NODE_HAS_OUTGOING",
+      message: `Ending node ${node.id} has outgoing targets.`,
+      nodeId: node.id,
+    })
+  }
+
+  if (hasChoices) return storyNode
+
+  const children = [...(node.children ?? [])].filter(Boolean)
+  if (children.length === 0) {
+    if (type !== "ending") {
+      report.warnings.push({
+        code: "NON_ENDING_NODE_HAS_NO_OUTGOING",
+        message: `Non-ending node ${node.id} has no choices or children.`,
+        nodeId: node.id,
+      })
+    }
+    return storyNode
+  }
+
+  if (children.length > 1) {
+    report.errors.push({
+      code: "NODE_HAS_MULTIPLE_DIRECT_CHILDREN",
+      message: `Node ${node.id} has multiple children but no choices.`,
+      nodeId: node.id,
+      routeId: route.id,
+    })
+    return storyNode
+  }
+
+  const nextNodeId = children[0]
+  storyNode.nextNodeId = nextNodeId
+  if (!nodeById.has(nextNodeId)) {
+    report.errors.push({
+      code: "NEXT_NODE_NOT_FOUND",
+      message: `Node ${node.id} points to missing child ${nextNodeId}.`,
+      nodeId: node.id,
+      routeId: route.id,
+    })
+  }
+  return storyNode
+}
+
+export async function buildStoryBundle(
+  projectPath: string,
+  project: GalProject,
+  exportedAt = new Date().toISOString(),
+): Promise<StoryBundleBuildResult> {
+  const report = createEmptyExportReport(exportedAt)
+  const graphRoutes = collectGraphRoutes(project)
+  const storyRoutes = normalizeStoryRoutes(project)
+  const scriptsByNode = new Map<string, string>()
+  const charactersByName = new Map<string, CharacterDefinition>()
+
+  for (const character of collectKnownCharacters({ routes: graphRoutes })) {
+    addKnownCharacter(charactersByName, character)
+  }
+
+  for (const route of graphRoutes) {
+    for (const node of route.nodes ?? []) {
+      const script = (await loadNodeScript(projectPath, route.id, node.id)) ?? ""
+      scriptsByNode.set(makeRouteNodeKey(route.id, node.id), script)
+
+      const parsed = parseScriptBlocks(node.id, script, [...charactersByName.values()])
+      for (const character of parsed.characters) {
+        addKnownCharacter(charactersByName, character)
+      }
+      report.warnings.push(...parsed.warnings.filter((warning) => warning.code === "SCRIPT_UNKNOWN_CHARACTER"))
+    }
+  }
+
+  const characters = [...charactersByName.values()]
+  const storyNodes: StoryNode[] = []
+  for (const route of graphRoutes) {
+    const nodeById = new Map((route.nodes ?? []).map((node) => [node.id, node]))
+    for (const node of route.nodes ?? []) {
+      storyNodes.push(buildStoryNode(
+        node,
+        route,
+        nodeById,
+        scriptsByNode.get(makeRouteNodeKey(route.id, node.id)) ?? "",
+        project.variables ?? [],
+        report,
+        characters,
+      ))
+    }
+  }
+
+  report.stats = {
+    routes: storyRoutes.length,
+    nodes: storyNodes.length,
+    scriptsReady: storyNodes.filter((node) => node.status === "ready").length,
+    scriptsMissing: storyNodes.filter((node) => node.status === "missing-script").length,
+    choices: storyNodes.reduce((count, node) => count + node.choices.length, 0),
+    endings: storyNodes.filter((node) => node.type === "ending").length,
+  }
+
+  const mainGraphRoute = graphRoutes.find((route) => route.id === "main") ?? graphRoutes[0]
+  return {
+    bundle: {
+      schemaVersion: 1,
+      contentVersion: project.updatedAt || exportedAt,
+      storyId: project.id,
+      title: project.title,
+      exportedAt,
+      entryNodeId: mainGraphRoute?.entryNodeId ?? "",
+      variables: normalizeVariableDefinitions(project),
+      characters,
+      routes: storyRoutes,
+      nodes: storyNodes,
+    },
+    report,
+  }
 }
 
 function normalizeVariableDefinition(variable: GalVariable): VariableDefinition {
@@ -325,20 +495,104 @@ function normalizeSavedPathStoryRoute(route: GalRoute): StoryRoute {
   }
 }
 
-function buildCharacterMap(knownCharacters: KnownCharacter[]): Map<string, string> {
-  const charactersByName = new Map<string, string>()
+function makeRouteNodeKey(routeId: string, nodeId: string): string {
+  return `${routeId}:${nodeId}`
+}
+
+function mapStoryNodeType(node: GalNode, route: GalRoute): StoryNode["type"] {
+  if (node.type === "entry") return "entry"
+  if (node.type === "ending" || (route.endingNodeIds ?? []).includes(node.id)) return "ending"
+  return "normal"
+}
+
+function collectNodeCharacterIds(node: GalNode, knownCharacters: CharacterDefinition[]): string[] {
+  const idsByName = new Map(knownCharacters.map((character) => [character.name, character.id]))
+  return Array.from(new Set(
+    (node.characters ?? [])
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .map((name) => idsByName.get(name) ?? makeStableCharacterId(name)),
+  ))
+}
+
+function buildStoryChoice(
+  nodeId: string,
+  choice: GalNode["choices"][number],
+  index: number,
+  nodeById: Map<string, GalNode>,
+  variables: readonly GalVariable[],
+  report: ExportReport,
+): StoryChoice {
+  const id = choice.id?.trim() || `${nodeId}:choice:${index}`
+  const targetNodeId = choice.nextNodeId?.trim() ?? ""
+  if (!targetNodeId) {
+    report.errors.push({
+      code: "CHOICE_MISSING_TARGET",
+      message: `Choice ${id} on node ${nodeId} has no targetNodeId.`,
+      nodeId,
+    })
+  } else if (!nodeById.has(targetNodeId)) {
+    report.errors.push({
+      code: "CHOICE_TARGET_NOT_FOUND",
+      message: `Choice ${id} on node ${nodeId} points to missing node ${targetNodeId}.`,
+      nodeId,
+    })
+  }
+
+  const effects = mapStoryChoiceEffects(nodeId, id, choice.effects ?? [], variables, report)
+  return {
+    id,
+    text: choice.text,
+    targetNodeId,
+    ...(effects.length ? { effects } : {}),
+  }
+}
+
+function mapStoryChoiceEffects(
+  nodeId: string,
+  choiceId: string,
+  effects: GalNode["choices"][number]["effects"],
+  variables: readonly GalVariable[],
+  report: ExportReport,
+): NonNullable<StoryChoice["effects"]> {
+  const storyEffects: NonNullable<StoryChoice["effects"]> = []
+  for (const effect of effects ?? []) {
+    const variableId = resolveGalVariableId(effect.variable, variables)
+    if (!variableId) {
+      report.errors.push({
+        code: "CHOICE_EFFECT_VARIABLE_NOT_FOUND",
+        message: `Choice ${choiceId} on node ${nodeId} references missing variable ${effect.variable}.`,
+        nodeId,
+      })
+      continue
+    }
+    storyEffects.push({
+      variableId,
+      op: effect.op,
+      value: effect.value,
+    })
+  }
+  return storyEffects
+}
+
+function buildCharacterMap(knownCharacters: KnownCharacter[]): Map<string, CharacterDefinition> {
+  const charactersByName = new Map<string, CharacterDefinition>()
   for (const character of knownCharacters) {
     if (typeof character === "string") {
       const name = character.trim()
-      if (name) charactersByName.set(name, makeStableCharacterId(name))
+      if (name) charactersByName.set(name, { id: makeStableCharacterId(name), name })
       continue
     }
 
     const name = character.name.trim()
     const id = character.id.trim()
-    if (name && id) charactersByName.set(name, id)
+    if (name && id) charactersByName.set(name, { id, name })
   }
   return charactersByName
+}
+
+function normalizeKnownCharacterDefinitions(knownCharacters: KnownCharacter[]): CharacterDefinition[] {
+  return [...buildCharacterMap(knownCharacters).values()]
 }
 
 function addKnownCharacter(charactersByName: Map<string, CharacterDefinition>, character: KnownCharacter): void {
@@ -353,15 +607,15 @@ function addKnownCharacter(charactersByName: Map<string, CharacterDefinition>, c
   if (name && id && !charactersByName.has(name)) charactersByName.set(name, { id, name })
 }
 
-function resolveSpeakerId(
+function resolveSpeaker(
   nodeId: string,
   speakerName: string,
-  charactersByName: Map<string, string>,
+  charactersByName: Map<string, CharacterDefinition>,
   warnings: ExportReport["warnings"],
   line: number,
-): string {
-  const knownId = charactersByName.get(speakerName)
-  if (knownId) return knownId
+): CharacterDefinition {
+  const known = charactersByName.get(speakerName)
+  if (known) return known
 
   warnings.push({
     code: "SCRIPT_UNKNOWN_CHARACTER",
@@ -369,7 +623,7 @@ function resolveSpeakerId(
     nodeId,
     line,
   })
-  return makeStableCharacterId(speakerName)
+  return { id: makeStableCharacterId(speakerName), name: speakerName }
 }
 
 function makeStableCharacterId(name: string): string {

@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
+  buildStoryBundle,
+  buildStoryNode,
   collectKnownCharacters,
   collectGraphRoutes,
   collectSavedPathRoutes,
@@ -8,7 +10,16 @@ import {
   normalizeVariableDefinitions,
   parseScriptBlocks,
 } from "./gal-web-export"
+import { loadNodeScript } from "./gal-storage"
 import type { GalNode, GalProject, GalRoute, GalVariable } from "./gal-types"
+
+vi.mock("./gal-storage", () => ({
+  loadNodeScript: vi.fn(),
+}))
+
+beforeEach(() => {
+  vi.mocked(loadNodeScript).mockReset()
+})
 
 function node(id: string, routeId: string): GalNode {
   return {
@@ -82,6 +93,41 @@ function project(variables: GalVariable[] = []): GalProject {
     createdAt: "",
     updatedAt: "",
   }
+}
+
+function routeWithNodes(nodes: GalNode[], patch: Partial<GalRoute> = {}): GalRoute {
+  return {
+    id: "route",
+    title: "Route",
+    theme: "",
+    entryNodeId: nodes[0]?.id ?? "",
+    endingNodeIds: [],
+    nodes,
+    ...patch,
+  }
+}
+
+function countedGraphRoute(id: string, count: number): GalRoute {
+  const nodes = Array.from({ length: count }, (_, index) => {
+    const item = node(`${id}_${index}`, id)
+    item.type = index === 0 ? "entry" : index === count - 1 ? "ending" : "daily"
+    item.children = index < count - 1 ? [`${id}_${index + 1}`] : []
+    item.parents = index > 0 ? [`${id}_${index - 1}`] : []
+    item.characters = index === 0 ? ["Alex"] : []
+    return item
+  })
+  return {
+    id,
+    title: `${id} route`,
+    theme: "",
+    entryNodeId: `${id}_0`,
+    endingNodeIds: [`${id}_${count - 1}`],
+    nodes,
+  }
+}
+
+function nodeMap(nodes: GalNode[]): Map<string, GalNode> {
+  return new Map(nodes.map((item) => [item.id, item]))
 }
 
 describe("gal web export stage 1", () => {
@@ -331,5 +377,321 @@ describe("gal web export script parser", () => {
       },
     ])
     expect(result.warnings).toEqual([])
+  })
+})
+
+describe("gal web export story node builder", () => {
+  it("exports node choices with stable ids, targetNodeId, and valid effects", () => {
+    const start = node("start", "route")
+    const target = node("target", "route")
+    start.characters = ["Alex"]
+    start.children = ["target"]
+    start.choices = [{
+      id: "",
+      text: "Go to target",
+      emotionalIntent: "continue",
+      effects: [{ variable: "love", op: "add", value: 1 }],
+      nextNodeId: "target",
+    }]
+    const route = routeWithNodes([start, target])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(
+      start,
+      route,
+      nodeMap(route.nodes),
+      "Alex: Hello.",
+      [{ id: "love", name: "Love", type: "love", defaultValue: 0, description: "Love score." }],
+      report,
+    )
+
+    expect(storyNode).toMatchObject({
+      id: "start",
+      type: "normal",
+      status: "ready",
+      choices: [{
+        id: "start:choice:0",
+        text: "Go to target",
+        targetNodeId: "target",
+        effects: [{ variableId: "love", op: "add", value: 1 }],
+      }],
+    })
+    expect(storyNode.nextNodeId).toBeUndefined()
+    expect(report.errors).toEqual([])
+    expect(report.warnings).toEqual([])
+  })
+
+  it("exports nextNodeId when a node has no choices and exactly one child", () => {
+    const start = node("start", "route")
+    const child = node("child", "route")
+    start.children = ["child"]
+    const route = routeWithNodes([start, child])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode.nextNodeId).toBe("child")
+    expect(storyNode.choices).toEqual([])
+    expect(storyNode.status).toBe("missing-script")
+    expect(report.errors).toEqual([])
+    expect(report.warnings).toEqual([])
+  })
+
+  it("records an error when a node has multiple children but no choices", () => {
+    const start = node("start", "route")
+    const childA = node("child_a", "route")
+    const childB = node("child_b", "route")
+    start.children = ["child_a", "child_b"]
+    const route = routeWithNodes([start, childA, childB])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode.nextNodeId).toBeUndefined()
+    expect(report.errors).toEqual([{
+      code: "NODE_HAS_MULTIPLE_DIRECT_CHILDREN",
+      message: "Node start has multiple children but no choices.",
+      nodeId: "start",
+      routeId: "route",
+    }])
+  })
+
+  it("records a warning when a non-ending node has no choices or children", () => {
+    const start = node("start_entry", "route")
+    const route = routeWithNodes([start])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode).toMatchObject({
+      id: "start_entry",
+      type: "entry",
+      status: "missing-script",
+      choices: [],
+    })
+    expect(storyNode.nextNodeId).toBeUndefined()
+    expect(report.warnings).toEqual([{
+      code: "NON_ENDING_NODE_HAS_NO_OUTGOING",
+      message: "Non-ending node start_entry has no choices or children.",
+      nodeId: "start_entry",
+    }])
+  })
+
+  it("records an error when a choice points to a missing target node", () => {
+    const start = node("start", "route")
+    start.choices = [{
+      id: "choice_missing",
+      text: "Missing target",
+      emotionalIntent: "continue",
+      effects: [],
+      nextNodeId: "missing",
+    }]
+    const route = routeWithNodes([start])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode.choices[0]).toMatchObject({
+      id: "choice_missing",
+      targetNodeId: "missing",
+    })
+    expect(report.errors).toEqual([{
+      code: "CHOICE_TARGET_NOT_FOUND",
+      message: "Choice choice_missing on node start points to missing node missing.",
+      nodeId: "start",
+    }])
+  })
+
+  it("records an error when a direct nextNodeId points to a missing node", () => {
+    const start = node("start", "route")
+    start.children = ["missing"]
+    const route = routeWithNodes([start])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode.nextNodeId).toBe("missing")
+    expect(report.errors).toEqual([{
+      code: "NEXT_NODE_NOT_FOUND",
+      message: "Node start points to missing child missing.",
+      nodeId: "start",
+      routeId: "route",
+    }])
+  })
+
+  it("records an error when a choice effect references an unknown variable", () => {
+    const start = node("start", "route")
+    const target = node("target", "route")
+    start.choices = [{
+      id: "choice_bad_effect",
+      text: "Bad effect",
+      emotionalIntent: "continue",
+      effects: [{ variable: "unknown", op: "set", value: true }],
+      nextNodeId: "target",
+    }]
+    const route = routeWithNodes([start, target])
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(start, route, nodeMap(route.nodes), "", [], report)
+
+    expect(storyNode.choices[0].effects).toBeUndefined()
+    expect(report.errors).toEqual([{
+      code: "CHOICE_EFFECT_VARIABLE_NOT_FOUND",
+      message: "Choice choice_bad_effect on node start references missing variable unknown.",
+      nodeId: "start",
+    }])
+  })
+
+  it("marks ending nodes and warns when they still have outgoing targets", () => {
+    const ending = node("ending", "route")
+    const after = node("after", "route")
+    ending.type = "ending"
+    ending.children = ["after"]
+    const route = routeWithNodes([ending, after], { endingNodeIds: ["ending"] })
+    const report = createEmptyExportReport("2026-07-11T00:00:00.000Z")
+
+    const storyNode = buildStoryNode(ending, route, nodeMap(route.nodes), "The end.", [], report)
+
+    expect(storyNode).toMatchObject({
+      id: "ending",
+      type: "ending",
+      status: "ready",
+      endingId: "ending",
+      nextNodeId: "after",
+    })
+    expect(report.warnings).toEqual(expect.arrayContaining([{
+      code: "ENDING_NODE_HAS_OUTGOING",
+      message: "Ending node ending has outgoing targets.",
+      nodeId: "ending",
+    }]))
+  })
+})
+
+describe("gal web export story bundle builder", () => {
+  it("builds a self-contained bundle from all graph route nodes", async () => {
+    const main = countedGraphRoute("main", 141)
+    const side = countedGraphRoute("side", 4)
+    const legacy = {
+      ...savedPathRoute(),
+      nodes: [node("saved_only", "saved_path")],
+    }
+    const sample: GalProject = {
+      ...project(),
+      id: "story_id",
+      title: "Story title",
+      updatedAt: "2026-07-11T01:00:00.000Z",
+      routes: [main, side, legacy],
+    }
+    vi.mocked(loadNodeScript).mockImplementation(async (_projectPath, routeId, nodeId) => `Alex: ${routeId}/${nodeId}`)
+
+    const { bundle, report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(bundle).toMatchObject({
+      schemaVersion: 1,
+      contentVersion: "2026-07-11T01:00:00.000Z",
+      storyId: "story_id",
+      title: "Story title",
+      exportedAt: "2026-07-11T02:00:00.000Z",
+      entryNodeId: "main_0",
+    })
+    expect(bundle.routes.map((route) => [route.id, route.kind])).toEqual([
+      ["main", "graph"],
+      ["side", "graph"],
+      ["saved_path", "saved-path"],
+    ])
+    expect(bundle.nodes).toHaveLength(145)
+    expect(bundle.nodes.some((item) => item.id === "saved_only")).toBe(false)
+    expect(bundle.characters).toEqual([{ id: "character_17sqm", name: "Alex" }])
+    expect(report.stats).toEqual({
+      routes: 3,
+      nodes: 145,
+      scriptsReady: 145,
+      scriptsMissing: 0,
+      choices: 0,
+      endings: 2,
+    })
+  })
+
+  it("does not copy saved-path nodes into StoryBundle.nodes", async () => {
+    const main = countedGraphRoute("main", 2)
+    const legacy = {
+      ...savedPathRoute(),
+      nodes: [node("saved_only", "saved_path")],
+    }
+    const sample: GalProject = { ...project(), routes: [main, legacy] }
+    vi.mocked(loadNodeScript).mockResolvedValue("Alex: body")
+
+    const { bundle } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(bundle.routes.find((route) => route.id === "saved_path")).toMatchObject({
+      kind: "saved-path",
+      nodeIds: ["main_entry", "main_ending"],
+    })
+    expect(bundle.nodes.map((item) => item.id)).toEqual(["main_0", "main_1"])
+  })
+
+  it("loads independent route scripts using their own route ids", async () => {
+    const main = countedGraphRoute("main", 1)
+    const side = countedGraphRoute("side", 4)
+    const sample: GalProject = { ...project(), routes: [main, side] }
+    vi.mocked(loadNodeScript).mockImplementation(async (_projectPath, routeId, nodeId) => `Alex: loaded from ${routeId}/${nodeId}`)
+
+    const { bundle } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(vi.mocked(loadNodeScript)).toHaveBeenCalledWith("D:/project", "side", "side_0")
+    expect(vi.mocked(loadNodeScript)).toHaveBeenCalledWith("D:/project", "side", "side_3")
+    expect(bundle.nodes.find((item) => item.id === "side_0")?.script).toEqual([
+      {
+        id: "side_0:block:0",
+        type: "dialogue",
+        speakerId: "character_17sqm",
+        text: "loaded from side/side_0",
+      },
+    ])
+  })
+
+  it("collects character definitions from script speakers even when node characters are empty", async () => {
+    const start = node("main_0", "main")
+    start.type = "entry"
+    start.characters = []
+    const main = routeWithNodes([start], {
+      id: "main",
+      entryNodeId: "main_0",
+      endingNodeIds: [],
+    })
+    const sample: GalProject = { ...project(), routes: [main] }
+    vi.mocked(loadNodeScript).mockResolvedValue("Narrator: This speaker only exists in script.")
+
+    const { bundle } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+    const narrator = bundle.characters.find((character) => character.name === "Narrator")
+
+    expect(narrator?.id).toMatch(/^character_/)
+    expect(bundle.nodes[0].script).toEqual([
+      {
+        id: "main_0:block:0",
+        type: "dialogue",
+        speakerId: narrator?.id,
+        text: "This speaker only exists in script.",
+      },
+    ])
+  })
+
+  it("marks missing node scripts and counts them in the export report", async () => {
+    const main = countedGraphRoute("main", 2)
+    const side = countedGraphRoute("side", 4)
+    const sample: GalProject = { ...project(), routes: [main, side] }
+    vi.mocked(loadNodeScript).mockImplementation(async (_projectPath, _routeId, nodeId) => (
+      nodeId === "side_3" ? null : "Alex: body"
+    ))
+
+    const { bundle, report } = await buildStoryBundle("D:/project", sample, "2026-07-11T02:00:00.000Z")
+
+    expect(bundle.nodes.find((item) => item.id === "side_3")).toMatchObject({
+      id: "side_3",
+      status: "missing-script",
+      script: [],
+    })
+    expect(report.stats.scriptsReady).toBe(5)
+    expect(report.stats.scriptsMissing).toBe(1)
   })
 })
