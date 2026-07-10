@@ -187,6 +187,68 @@ describe("exportGalProjectContents", () => {
       },
     })
   })
+
+  it("writes markdown for saved nodeIds routes and independent route trees", async () => {
+    vi.mocked(readFile).mockResolvedValue("script body")
+    vi.mocked(writeFile).mockResolvedValue()
+    vi.mocked(createDirectory).mockResolvedValue()
+    vi.mocked(writeFile).mockClear()
+    const mainRoute = route([
+      node("entry", "main entry", [], ["main_end"]),
+      node("main_end", "main end", ["entry"], []),
+    ])
+    const savedRoute: GalRoute = {
+      id: "saved",
+      title: "Saved Path",
+      theme: "",
+      entryNodeId: "entry",
+      endingNodeIds: ["main_end"],
+      nodeIds: ["entry", "main_end"],
+      nodes: [],
+    }
+    const sideNodes = Array.from({ length: 4 }, (_, index) => ({
+      ...node(
+        `side_${index}`,
+        `side ${index}`,
+        index === 0 ? [] : [`side_${index - 1}`],
+        index < 3 ? [`side_${index + 1}`] : [],
+      ),
+      routeId: "side",
+      scriptPath: `nodes/side/side_${index}.md`,
+    }))
+    const sideRoute: GalRoute = {
+      id: "side",
+      title: "Side Route",
+      theme: "side theme",
+      entryNodeId: "side_0",
+      endingNodeIds: ["side_3"],
+      nodes: sideNodes,
+    }
+    const project: GalProject = {
+      id: "project",
+      title: "Story",
+      premise: "",
+      globalRules: "",
+      variables: [],
+      routes: [mainRoute, savedRoute, sideRoute],
+      cgs: [],
+      clues: [],
+      createdAt: "",
+      updatedAt: "",
+    }
+
+    await exportGalProjectContents("D:/project", "D:/exports", project)
+
+    const savedCall = vi.mocked(writeFile).mock.calls.find(([path]) => String(path).endsWith("/Saved Path.md"))
+    const sideCall = vi.mocked(writeFile).mock.calls.find(([path]) => String(path).endsWith("/Side Route.md"))
+    expect(savedCall?.[1]).toContain("# Saved Path")
+    expect(savedCall?.[1]).toContain("script body")
+    expect(sideCall?.[1]).toContain("# Side Route")
+    expect(sideCall?.[1]).toContain("side theme")
+    expect(sideCall?.[1]).toContain("side 0")
+    expect(sideCall?.[1]).toContain("side 3")
+    expect(sideCall?.[1]).toContain("script body")
+  })
 })
 
 describe("exportGalRouteTree", () => {

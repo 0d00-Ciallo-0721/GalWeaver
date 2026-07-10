@@ -305,6 +305,14 @@ export async function exportGalProjectContents(
     )
     routeCount++
   }
+  for (const route of project.routes.filter((item) => !Array.isArray(item.nodeIds) && item.id !== mainRoute.id)) {
+    const novel = await buildGalRouteTreeMarkdown(projectPath, route.id, route)
+    await writeFile(
+      joinPath(routeDir, `${makeSafeExportName(route.title)}.md`),
+      novel.content,
+    )
+    routeCount++
+  }
 
   await writeFile(joinPath(exportPath, "完整线路图.svg"), buildGalRouteSvg(mainRoute))
   await writeFile(
