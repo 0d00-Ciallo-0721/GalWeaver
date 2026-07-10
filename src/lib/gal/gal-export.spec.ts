@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { readFile, writeFile } from "@/commands/fs"
+import { createDirectory, readFile, writeFile } from "@/commands/fs"
 import { buildGalNovelMarkdown, exportGalProjectContents, exportGalRouteTree, traceGalPathToEntry } from "./gal-export"
 import type { GalNode, GalProject, GalRoute } from "./gal-types"
 
@@ -124,6 +124,68 @@ describe("exportGalProjectContents", () => {
       // expect.stringContaining('"kind": "gal-route-export"'),
     */
     // )
+  })
+
+  it("writes web game-content files without removing legacy export files", async () => {
+    vi.mocked(readFile).mockResolvedValue("Alex: body")
+    vi.mocked(writeFile).mockResolvedValue()
+    vi.mocked(createDirectory).mockResolvedValue()
+    vi.mocked(writeFile).mockClear()
+    vi.mocked(createDirectory).mockClear()
+    const entry = node("entry", "entry", [], [])
+    entry.characters = ["Alex"]
+    const mainRoute = route([entry])
+    const project: GalProject = {
+      id: "project",
+      title: "Story",
+      premise: "",
+      globalRules: "",
+      variables: [],
+      routes: [mainRoute],
+      cgs: [],
+      clues: [],
+      createdAt: "",
+      updatedAt: "",
+    }
+
+    await exportGalProjectContents("D:/project", "D:/exports", project)
+
+    const writtenPaths = vi.mocked(writeFile).mock.calls.map(([path]) => String(path))
+    expect(writtenPaths.some((path) => path.endsWith("/.qmai-export.json"))).toBe(true)
+    expect(writtenPaths.some((path) => path.endsWith("/graph.json"))).toBe(true)
+    expect(writtenPaths.some((path) => path.endsWith(".svg"))).toBe(true)
+    expect(writtenPaths.some((path) => path.endsWith(".md"))).toBe(true)
+    expect(writtenPaths.some((path) => path.includes("/game-content/story.bundle.json"))).toBe(true)
+    expect(writtenPaths.some((path) => path.includes("/game-content/asset-slots.template.json"))).toBe(true)
+    expect(writtenPaths.some((path) => path.includes("/game-content/export-report.json"))).toBe(true)
+    expect(vi.mocked(createDirectory).mock.calls.some(([path]) => (
+      String(path).endsWith("/game-content")
+    ))).toBe(true)
+
+    const storyBundleCall = vi.mocked(writeFile).mock.calls.find(([path]) => (
+      String(path).includes("/game-content/story.bundle.json")
+    ))
+    const reportCall = vi.mocked(writeFile).mock.calls.find(([path]) => (
+      String(path).includes("/game-content/export-report.json")
+    ))
+
+    expect(JSON.parse(String(storyBundleCall?.[1]))).toMatchObject({
+      schemaVersion: 1,
+      storyId: "project",
+      title: "Story",
+      entryNodeId: "entry",
+    })
+    expect(JSON.parse(String(reportCall?.[1]))).toMatchObject({
+      schemaVersion: 1,
+      stats: {
+        routes: 1,
+        nodes: 1,
+        scriptsReady: 1,
+        scriptsMissing: 0,
+        choices: 0,
+        endings: 0,
+      },
+    })
   })
 })
 

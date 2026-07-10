@@ -3,6 +3,7 @@ import { isTauri } from "@/lib/platform"
 import { getNodeOutgoingTargets } from "./gal-graph-normalize"
 import { loadNodeScript, saveGalProject, saveNodeScript } from "./gal-storage"
 import type { GalNode, GalProject, GalRoute } from "./gal-types"
+import { buildAssetSlotsTemplate, buildStoryBundle } from "./gal-web-export"
 
 export interface GalIncomingPathOption {
   parentId: string
@@ -313,6 +314,21 @@ export async function exportGalProjectContents(
   await writeFile(
     joinPath(exportPath, "线路总览.md"),
     buildProjectOverview(project, mainRoute, nodeCount, routeCount, missingNodes),
+  )
+  const gameContentDir = joinPath(exportPath, "game-content")
+  const webContent = await buildStoryBundle(projectPath, project)
+  await createDirectory(gameContentDir)
+  await writeFile(
+    joinPath(gameContentDir, "story.bundle.json"),
+    JSON.stringify(webContent.bundle, null, 2),
+  )
+  await writeFile(
+    joinPath(gameContentDir, "asset-slots.template.json"),
+    JSON.stringify(buildAssetSlotsTemplate(webContent.bundle), null, 2),
+  )
+  await writeFile(
+    joinPath(gameContentDir, "export-report.json"),
+    JSON.stringify(webContent.report, null, 2),
   )
 
   return { exportPath, nodeCount, routeCount, missingNodes }
